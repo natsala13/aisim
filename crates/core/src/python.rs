@@ -995,6 +995,7 @@ impl AicTimingModel {
             .provenance()
             .context("canonical estimator omitted construction provenance")?;
         config.backend_version = provenance.config.backend_version.clone();
+        config.nextn = provenance.config.nextn;
         config.speculation = provenance.config.speculation.clone();
         // Canonical construction validates and resolves cost identity first;
         // executor-specific width limits must not reclassify loader failures.
@@ -1078,8 +1079,9 @@ impl AicTimingModel {
     /// work the iteration query cannot describe is rejected here: a vision
     /// tower, speculative decoding other than the MTP rounds a vLLM regression
     /// was fitted to, and bounded decoder replay. Such a regression pins its
-    /// `nextn`, which the scheduler's `aic_nextn` must match. Only vLLM's
-    /// telemetry gives an MTP decode request its verification width as extend.
+    /// `nextn`, which the scheduler's `aic_nextn` must match; it takes an MTP
+    /// scheme as that `nextn`. Only vLLM's telemetry gives an MTP decode
+    /// request its verification width as extend.
     fn require_fitted_role(
         config: &AicTimingConfig,
         mode: EstimationMode,
@@ -1090,14 +1092,16 @@ impl AicTimingModel {
             "{} cannot time a rank hosting the vision encoder; it prices only language-model iterations",
             wire_name(mode)
         );
+        // An MTP scheme is priced as the `nextn` of its depth.
         require_fitted_execution(
             mode,
             &config.backend,
-            config.nextn > 0,
+            config.speculative_depth()? > 0,
             config
                 .speculation
                 .as_ref()
-                .map(|speculation| speculation.kind.as_str()),
+                .map(|speculation| speculation.kind.as_str())
+                .filter(|kind| *kind != "mtp"),
             config.decoder_replay,
         )
     }
@@ -7554,6 +7558,50 @@ mod tests {
         assert_eq!(extend, [4, 6, 6]);
         let ms = iteration_ms(&timing, &[rank]);
         assert!((ms - (2.0 + 0.25 * 16.0)).abs() < 1e-9, "{ms}");
+    }
+
+    #[test]
+    fn fitted_regression_takes_an_mtp_scheme_as_its_nextn() {
+        pyo3::prepare_freethreaded_python();
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
+        identity.nextn = 2;
+        let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
+        model
+            .tune_with_fpms(&fitted_training_iterations(&[IterationKind::Decode], false))
+            .unwrap();
+        let mut legacy = snapshot_timing_config(&model, &dir.path().join("snapshot"));
+        let mtp = |depth: u32| {
+            let mut config = legacy.clone();
+            config.nextn = 0;
+            config.speculation = Some(
+                serde_json::from_value(
+                    serde_json::json!({"kind": "mtp", "params": {"depth": depth}}),
+                )
+                .unwrap(),
+            );
+            config
+        };
+        let (mut scheme, mut deeper) = (mtp(2), mtp(3));
+        let timing =
+            AicTimingModel::build(&mut legacy, ForwardPassWorkerType::Decode, false).unwrap();
+        let scheme_timing =
+            AicTimingModel::build(&mut scheme, ForwardPassWorkerType::Decode, false).unwrap();
+        // Replay continues at the snapshot's nextn and prices every pass alike.
+        assert_eq!((scheme.nextn, scheme.speculation), (2, None));
+        let mut rank = fitted_work(0, None, Some(&[700, 900]));
+        rank.decode.as_mut().unwrap().verify_width = 3;
+        assert_eq!(
+            iteration_ms(&scheme_timing, &[rank.clone()]),
+            iteration_ms(&timing, &[rank])
+        );
+        // A scheme of another depth is another identity.
+        let error = AicTimingModel::build(&mut deeper, ForwardPassWorkerType::Decode, false)
+            .err()
+            .expect("the snapshot was fitted at nextn 2");
+        assert!(
+            format!("{error:#}").contains("differs from the snapshot's pinned identity at nextn")
+        );
     }
 
     #[test]

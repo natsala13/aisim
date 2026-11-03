@@ -116,7 +116,10 @@ timing so the canonical constructor retains draft costs; fixed and polynomial
 timing are rejected for generic schemes. OP/SOL support and estimator fallback
 follow the [cost-model contract](../../perf-model/configuration.md#speculative-decoding-configuration):
 an explicit FPM request with `fallback_policy: deny` fails, while an allowed
-fallback can select OP without discarding the scheme.
+fallback can select OP without discarding the scheme. The exception is a vLLM
+`fpm_regression` snapshot fitted at `nextn` N: it times `kind: mtp` with
+`depth: N` as that `nextn`; see
+[engine replay timing](../../perf-model/configuration.md#engine-replay-timing).
 
 `kind: mtp` also supports [G2 host offload](kv-cache.md#host-offload-g2)
 on aggregated vLLM with `attention_data: 1`, prefix caching enabled and
