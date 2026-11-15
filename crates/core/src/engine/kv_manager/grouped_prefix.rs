@@ -487,13 +487,61 @@ pub(crate) enum GroupHitBlocks {
 }
 
 /// The reconciled hit of every group (`coord:842-977`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GroupedHit {
     pub(crate) tokens: usize,
     /// The uncached common prefix: the longest hit of one spec group's
     /// lookup minus `tokens` (`coord:970-977`, `mgr:312-321`).
     pub(crate) junction_tokens: usize,
     pub(crate) per_group: Vec<GroupHitBlocks>,
+}
+
+/// See [`GroupedPrefixCoordinator::hit_stamp`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GroupedHitStamp {
+    residency: (u64, u64),
+    published_epoch: u64,
+    num_tokens: usize,
+}
+
+/// A request's grouped hit, and the stamp of the search that found it. The
+/// fields are private, so a stamp comes only with the hit of its own search
+/// ([`Self::searched`]). Every other hit, such as one that a request gets
+/// without a search, enters through [`Self::unsearched`] and is never reused.
+#[derive(Debug)]
+pub(crate) struct StoredGroupedHit {
+    hit: GroupedHit,
+    stamp: Option<GroupedHitStamp>,
+}
+
+impl StoredGroupedHit {
+    /// The hit of a search whose inputs had the stamp `stamp`.
+    pub(crate) fn searched(hit: GroupedHit, stamp: GroupedHitStamp) -> Self {
+        Self {
+            hit,
+            stamp: Some(stamp),
+        }
+    }
+
+    /// A hit that no search with known inputs found.
+    pub(crate) fn unsearched(hit: GroupedHit) -> Self {
+        Self { hit, stamp: None }
+    }
+
+    pub(crate) fn hit(&self) -> &GroupedHit {
+        &self.hit
+    }
+
+    /// The hit, when a search with the inputs of `stamp` found it, so that a
+    /// new search would find it again.
+    pub(crate) fn reusable(&self, stamp: &GroupedHitStamp) -> Option<&GroupedHit> {
+        (self.stamp.as_ref() == Some(stamp)).then_some(&self.hit)
+    }
+
+    /// Forget the search inputs, when one of them changes outside the stamp.
+    pub(crate) fn drop_stamp(&mut self) {
+        self.stamp = None;
+    }
 }
 
 /// The coordinator: the rules, and the state keys published in the current
@@ -504,6 +552,9 @@ pub(crate) struct GroupedPrefixCoordinator {
     rules: GroupedPrefixRules,
     limits: AdmissionLimits,
     published_this_step: FxHashSet<CacheKey>,
+    /// Raised when `published_this_step` gains a key or is cleared while
+    /// not empty. Equal values mean the same set.
+    published_epoch: u64,
     /// Scratch buffers of `allocate`, which runs for every scheduled request
     /// in every step. They are cleared and used again, so an allocation
     /// allocates no heap memory once they have grown.
@@ -594,6 +645,7 @@ impl GroupedPrefixCoordinator {
             rules,
             limits,
             published_this_step: FxHashSet::default(),
+            published_epoch: 0,
             plan: Vec::new(),
             releases: Vec::new(),
         }
@@ -604,7 +656,23 @@ impl GroupedPrefixCoordinator {
     }
 
     pub(crate) fn begin_step(&mut self) {
+        self.published_epoch += u64::from(!self.published_this_step.is_empty());
         self.published_this_step.clear();
+    }
+
+    /// Every input of [`Self::find_longest_hit`] that can change while a
+    /// request waits: the pool, its resident keys, the keys published in
+    /// this step and the request's token count. The other inputs, the rules
+    /// and the request's prefix hashes, are fixed once the lease has its
+    /// prefix hashes. The search reads the pool only through
+    /// `key_hit(..).is_some()`. So two searches of one lease with equal
+    /// stamps give equal hits.
+    pub(crate) fn hit_stamp(&self, pool: &GroupedBlockPool, num_tokens: usize) -> GroupedHitStamp {
+        GroupedHitStamp {
+            residency: pool.residency(),
+            published_epoch: self.published_epoch,
+            num_tokens,
+        }
     }
 
     /// An empty block lease with one entry per group.
@@ -1192,7 +1260,7 @@ impl GroupedPrefixCoordinator {
                         // hits on it to the next step (v0.31
                         // `single:1931-1934`, v0.32 `single:1895-1898`).
                         if let Some(key) = state.published.take() {
-                            self.published_this_step.insert(key);
+                            self.published_epoch += u64::from(self.published_this_step.insert(key));
                         }
                         let new = pool.take_private(&mut reservation);
                         if let Some(old) = state.running.replace(new) {
@@ -1335,7 +1403,7 @@ impl GroupedPrefixCoordinator {
                         && let Some(key) = key_at(computed_after)
                     {
                         pool.cache(id, key);
-                        self.published_this_step.insert(key);
+                        self.published_epoch += u64::from(self.published_this_step.insert(key));
                         if !computed_after.is_multiple_of(block) {
                             state.published = Some(key);
                         }
@@ -1351,7 +1419,7 @@ impl GroupedPrefixCoordinator {
                         && let Some(key) = key_at(pos)
                     {
                         pool.cache(id, key);
-                        self.published_this_step.insert(key);
+                        self.published_epoch += u64::from(self.published_this_step.insert(key));
                     }
                     // The hit and previous blocks go after one pass, as on the
                     // linear path and in the runtime probe, which ran without

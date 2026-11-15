@@ -2411,3 +2411,197 @@ fn first_allocation_test_counts_the_blocks_that_the_first_allocation_takes() {
     }
     assert!(hits > 200, "{hits} hits");
 }
+
+#[test]
+fn hit_stamp_changes_exactly_when_a_search_input_changes() {
+    // Full attention and a cacheable state, both of 4-token blocks, at hash
+    // 4, in a pool of 3 blocks.
+    let groups = [attention("full", 4, None), state("s", 4, true, false)];
+    let mut coordinator = with_limits(rules(&groups, 4));
+    let mut kv = kv_pool(&groups, 3);
+    let pool = kv.block_pool_mut().unwrap();
+    let start = coordinator.hit_stamp(pool, 8);
+    assert_eq!(coordinator.hit_stamp(pool, 8), start);
+    // The token count.
+    assert_ne!(coordinator.hit_stamp(pool, 9), start);
+    // Another pool with the same resident keys.
+    let other = kv_pool(&groups, 3);
+    assert_ne!(coordinator.hit_stamp(other.block_pool().unwrap(), 8), start);
+    // Clearing an empty published set changes nothing.
+    coordinator.begin_step();
+    assert_eq!(coordinator.hit_stamp(pool, 8), start);
+
+    // A key enters the index.
+    seed(pool, key(0, 4, 4));
+    let one = coordinator.hit_stamp(pool, 8);
+    assert_ne!(one.residency, start.residency);
+    // Pinning, activating and releasing it changes no residency.
+    let mut reservation = pool.reserve(&[key(0, 4, 4)], 0).unwrap();
+    let copies = pool.activate(&mut reservation);
+    pool.cancel(reservation);
+    pool.release_all(copies);
+    assert_eq!(coordinator.hit_stamp(pool, 8), one);
+    // Nor does a second copy of the same key, or the loss of one of two
+    // copies.
+    let mut reservation = pool.reserve(&[], 1).unwrap();
+    let id = pool.take_private(&mut reservation);
+    pool.cancel(reservation);
+    assert!(!pool.cache(id, key(0, 4, 4)));
+    pool.release(id);
+    assert_eq!(coordinator.hit_stamp(pool, 8), one);
+    let reservation = pool.reserve(&[], 2).unwrap();
+    assert!(hit_exists(pool, 0, 4, 4));
+    assert_eq!(coordinator.hit_stamp(pool, 8), one);
+    pool.cancel(reservation);
+    // The key leaves the index with its last copy.
+    let reservation = pool.reserve(&[], 3).unwrap();
+    assert!(!hit_exists(pool, 0, 4, 4));
+    let gone = coordinator.hit_stamp(pool, 8);
+    assert_ne!(gone.residency, one.residency);
+    pool.cancel(reservation);
+
+    // A state key published in the step, then the clear of the set.
+    let request = lease(9, 4);
+    let mut block_lease = coordinator.new_lease();
+    assert!(coordinator.allocate(pool, &mut block_lease, 9, 0, 8, 1));
+    let before = coordinator.hit_stamp(pool, 9);
+    let no_hit = coordinator.empty_hit();
+    coordinator.finalize(pool, &mut block_lease, &request, 9, 8, &no_hit, 1);
+    let published = coordinator.hit_stamp(pool, 9);
+    assert!(coordinator.published_this_step.contains(&key(1, 4, 8)));
+    assert_ne!(published.published_epoch, before.published_epoch);
+    coordinator.begin_step();
+    let cleared = coordinator.hit_stamp(pool, 9);
+    assert_ne!(cleared.published_epoch, published.published_epoch);
+    assert_eq!(cleared.residency, published.residency);
+    coordinator.release_request(pool, &mut block_lease);
+}
+
+/// Publish in this step, through `finalize`, a second copy of a state key that
+/// is already resident, and return whether a hit stored before that publish
+/// would still be reused. The residency of every key stays the same, so only
+/// the published set tells the waiting request that its hit changed.
+fn reused_after_a_duplicate_state_publish(
+    groups: &[FpmCacheGroup],
+    version: VllmRuleVersion,
+    hash: usize,
+    seeded: usize,
+    waiting_tokens: usize,
+    running_prompt: usize,
+    running_target: usize,
+) -> bool {
+    let mut coordinator = with_limits(GroupedPrefixRules::new(groups, hash, version).unwrap());
+    let mut kv = kv_pool(groups, 32);
+    let pool = kv.block_pool_mut().unwrap();
+    // An earlier request left the keys of its first `seeded` tokens.
+    let ends: Vec<usize> = (1..=seeded / hash).map(|i| i * hash).collect();
+    seed_many(pool, 0, hash, &ends);
+    seed(pool, key(1, hash, seeded));
+    let waiting = lease(waiting_tokens, hash);
+    let first = coordinator.find_longest_hit(pool, &waiting, waiting_tokens);
+    assert_eq!(first.tokens, seeded);
+    let stored =
+        StoredGroupedHit::searched(first.clone(), coordinator.hit_stamp(pool, waiting_tokens));
+    let residency = pool.residency();
+    // A running request with the same tokens started cold. Its chunk up to
+    // `running_target` publishes its state at `seeded` in this step.
+    let request = lease(running_prompt, hash);
+    let mut block_lease = coordinator.new_lease();
+    let target = running_target;
+    assert!(coordinator.allocate(pool, &mut block_lease, running_prompt, 0, target, 1));
+    let no_hit = coordinator.empty_hit();
+    coordinator.finalize(
+        pool,
+        &mut block_lease,
+        &request,
+        running_prompt,
+        target,
+        &no_hit,
+        1,
+    );
+    assert!(
+        coordinator
+            .published_this_step
+            .contains(&key(1, hash, seeded))
+    );
+    assert_eq!(pool.residency(), residency, "a second copy keeps every key");
+    // A state key published in this step is no hit (single:1726-1734).
+    let fresh = coordinator.find_longest_hit(pool, &waiting, waiting_tokens);
+    assert_ne!(fresh, first);
+    let reused = stored
+        .reusable(&coordinator.hit_stamp(pool, waiting_tokens))
+        .is_some();
+    coordinator.release_request(pool, &mut block_lease);
+    reused
+}
+
+#[test]
+fn a_published_running_state_key_ends_the_reuse_of_a_stored_hit() {
+    // vLLM 0.31.0, no checkpoint: the running state of a 9-token request is
+    // kept at its replay boundary 8, which a waiting 9-token request hits.
+    let groups = [attention("full", 4, None), state("s", 4, true, false)];
+    assert!(!reused_after_a_duplicate_state_publish(
+        &groups,
+        VllmRuleVersion::V0_31_0,
+        4,
+        8,
+        9,
+        9,
+        8
+    ));
+}
+
+#[test]
+fn a_published_checkpoint_state_key_ends_the_reuse_of_a_stored_hit() {
+    // vLLM 0.32.0 with a checkpoint block: a 40-token prompt that runs in one
+    // chunk exports its checkpoint at 32 (v0.32 iface:1110-1146), which a
+    // waiting 41-token request hits.
+    let groups = [attention("full", 16, None), state("s", 16, true, true)];
+    assert!(!reused_after_a_duplicate_state_publish(
+        &groups,
+        VllmRuleVersion::V0_32_0,
+        16,
+        32,
+        41,
+        40,
+        40
+    ));
+}
+
+#[test]
+fn a_moved_producer_state_key_ends_the_reuse_of_a_stored_hit() {
+    // The copy of a state that the request published inside its running
+    // block hides the key for the rest of the step (v0.31
+    // single:1931-1934, v0.32 single:1895-1898). The residency of every key
+    // stays the same, so only the published set tells the waiting request
+    // that its hit changed.
+    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+        let groups = [attention("full", 32, None), state("s", 32, true, false)];
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+        let mut kv = kv_pool(&groups, 8);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(50, 4);
+        let hit = coordinator.find_longest_hit(pool, &request, 50);
+        let mut block_lease = coordinator.new_lease();
+        let mut before = 0;
+        for (step, target) in [(1, 32), (2, 48)] {
+            coordinator.begin_step();
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, step));
+            coordinator.finalize(pool, &mut block_lease, &request, 50, target, &hit, step);
+            before = target;
+        }
+        coordinator.begin_step();
+        let waiting = lease(60, 4);
+        let first = coordinator.find_longest_hit(pool, &waiting, 60);
+        assert_eq!(first.tokens, 48, "{version:?}");
+        let stored = StoredGroupedHit::searched(first, coordinator.hit_stamp(pool, 60));
+        let residency = pool.residency();
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 3));
+        assert_eq!(pool.residency(), residency, "{version:?}");
+        assert!(
+            stored.reusable(&coordinator.hit_stamp(pool, 60)).is_none(),
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut block_lease);
+    }
+}

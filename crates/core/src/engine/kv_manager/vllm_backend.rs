@@ -22,9 +22,9 @@ use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
 use super::AllocationRequirement;
-use super::grouped::{GroupedKvPool, GroupedLease};
+use super::grouped::{GroupedBlockPool, GroupedKvPool, GroupedLease};
 use super::grouped_prefix::{
-    AdmissionLimits, GroupedHit, GroupedPrefixCoordinator, GroupedPrefixRules,
+    AdmissionLimits, GroupedHit, GroupedPrefixCoordinator, GroupedPrefixRules, StoredGroupedHit,
 };
 use super::state_cache_manager::{StateCacheManager, StateRequest};
 use crate::engine::belady::BeladyOracle;
@@ -210,8 +210,11 @@ pub(crate) struct BlockRequestLease {
     pending_capacity_writes: Option<Box<PendingCapacityWrites>>,
     grouped: Option<GroupedLease>,
     /// The grouped prefix hit found at admission, so that the allocation
-    /// does not search again. Cleared by preemption.
-    grouped_hit: Option<GroupedHit>,
+    /// does not search again, with the stamp of the search inputs when a
+    /// search found it. A lookup with the same stamp reuses the hit. A hit
+    /// that no search found enters through `StoredGroupedHit::unsearched`,
+    /// which holds no stamp. Cleared by preemption.
+    grouped_hit: Option<StoredGroupedHit>,
     /// The request's known tokens at its last grouped lookup, so that its
     /// allocation takes vLLM's prefill end `max(prompt, num_tokens - 1)`
     /// (v0.32 `vllm/v1/core/kv_cache_manager.py:518-520`). 0 before any
@@ -279,6 +282,10 @@ impl BlockRequestLease {
             })
             .collect();
         self.prefix_hashes = Some((unit, hashes));
+        // The hashes are an input of the grouped search.
+        if let Some(stored) = &mut self.grouped_hit {
+            stored.drop_stamp();
+        }
     }
 
     fn state_hash(&self, tokens: usize, block_size: usize) -> Option<SequenceHash> {
@@ -316,6 +323,7 @@ impl BlockRequestLease {
     pub(crate) fn grouped_junction(&self) -> usize {
         self.grouped_hit
             .as_ref()
+            .map(StoredGroupedHit::hit)
             .map_or(0, |hit| hit.tokens + hit.junction_tokens)
     }
 
@@ -991,6 +999,7 @@ impl VllmKvManager {
                 let hit = lease
                     .grouped_hit
                     .as_ref()
+                    .map(StoredGroupedHit::hit)
                     .expect("a grouped prefill cost precedes the allocation");
                 // A resumed request replays its output tokens in its
                 // prefill (v0.32 `mgr:518-520`).
@@ -1734,6 +1743,7 @@ impl VllmKvManager {
                 let hit = lease
                     .grouped_hit
                     .as_ref()
+                    .map(StoredGroupedHit::hit)
                     .expect("a grouped prefill cost precedes the allocation");
                 coordinator.finalize(
                     grouped.block_pool_mut().expect("block mode"),
@@ -2041,7 +2051,7 @@ impl VllmKvManager {
         }
         self.release_lease_entries(lease);
         lease.allocated_tokens = 0;
-        // A re-admission searches the hit again.
+        // A re-admission searches the hit again. The stamp goes with the hit.
         lease.grouped_hit = None;
     }
 
@@ -2224,18 +2234,68 @@ impl VllmKvManager {
 
     /// The prefill cost of a waiting request, and for a grouped prefix cache
     /// the hit behind it, stored on the lease for the allocation.
+    ///
+    /// A request waits at the head of the queue for many steps, and most of
+    /// them change nothing that the search reads. So the lease keeps the
+    /// stamp of the search inputs with the hit, and the search runs again
+    /// only when the stamp changes (see `GroupedPrefixCoordinator::hit_stamp`).
+    /// The blocks and the active hit tokens read active and inactive block
+    /// state, which the stamp does not cover, so they are counted every time.
     pub(crate) fn lookup_prefill_cost(
         &self,
         sequence: &RequestSequence,
         lease: &mut BlockRequestLease,
     ) -> PrefillCost {
-        if self.grouped_prefix.is_some() {
-            let (cost, hit) = self.grouped_prefill_cost(sequence, lease);
-            lease.grouped_hit = Some(hit);
-            lease.grouped_known_tokens = sequence.len();
-            return cost;
+        if let Some(coordinator) = &self.grouped_prefix {
+            return self.lookup_grouped_prefill_cost(coordinator, sequence, lease);
         }
         self.get_lease_prefill_cost(sequence, lease)
+    }
+
+    /// The grouped part of [`Self::lookup_prefill_cost`]. Kept out of line,
+    /// so that the lookup of the other pools keeps its small frame.
+    #[inline(never)]
+    fn lookup_grouped_prefill_cost(
+        &self,
+        coordinator: &GroupedPrefixCoordinator,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        let pool = self.grouped_block_pool();
+        let known_tokens = sequence.len();
+        lease.grouped_known_tokens = known_tokens;
+        if self.enable_prefix_caching && sequence.enable_prefix_caching() {
+            let stamp = coordinator.hit_stamp(pool, known_tokens);
+            let reusable = lease
+                .grouped_hit
+                .as_ref()
+                .and_then(|stored| stored.reusable(&stamp));
+            if let Some(hit) = reusable {
+                debug_assert_eq!(
+                    hit,
+                    &coordinator.find_longest_hit(pool, lease, known_tokens),
+                    "a reused grouped hit differs from a new search"
+                );
+            } else {
+                let hit = coordinator.find_longest_hit(pool, lease, known_tokens);
+                lease.grouped_hit = Some(StoredGroupedHit::searched(hit, stamp));
+            }
+        } else {
+            lease.grouped_hit = Some(StoredGroupedHit::unsearched(coordinator.empty_hit()));
+        }
+        let hit = lease
+            .grouped_hit
+            .as_ref()
+            .map(StoredGroupedHit::hit)
+            .expect("the hit was just set");
+        self.grouped_hit_cost(hit, known_tokens)
+    }
+
+    fn grouped_block_pool(&self) -> &GroupedBlockPool {
+        self.grouped
+            .as_ref()
+            .and_then(GroupedKvPool::block_pool)
+            .expect("block mode")
     }
 
     /// The whole-prompt admission cost of a grouped prefix cache
@@ -2247,27 +2307,29 @@ impl VllmKvManager {
         lease: &BlockRequestLease,
     ) -> (PrefillCost, GroupedHit) {
         let coordinator = self.grouped_prefix.as_ref().expect("grouped prefix rules");
-        let pool = self
-            .grouped
-            .as_ref()
-            .and_then(GroupedKvPool::block_pool)
-            .expect("block mode");
+        let pool = self.grouped_block_pool();
         let known_tokens = sequence.len();
         let hit = if self.enable_prefix_caching && sequence.enable_prefix_caching() {
             coordinator.find_longest_hit(pool, lease, known_tokens)
         } else {
             coordinator.empty_hit()
         };
+        (self.grouped_hit_cost(&hit, known_tokens), hit)
+    }
+
+    /// The admission cost of `hit` for `known_tokens` request tokens.
+    fn grouped_hit_cost(&self, hit: &GroupedHit, known_tokens: usize) -> PrefillCost {
+        let coordinator = self.grouped_prefix.as_ref().expect("grouped prefix rules");
+        let pool = self.grouped_block_pool();
         let active_cached_tokens = coordinator
-            .active_full_attention_hit_tokens(pool, &hit)
+            .active_full_attention_hit_tokens(pool, hit)
             .min(hit.tokens);
-        let cost = PrefillCost {
-            new_blocks: coordinator.admission_blocks(pool, &hit, known_tokens),
+        PrefillCost {
+            new_blocks: coordinator.admission_blocks(pool, hit, known_tokens),
             new_tokens: known_tokens - hit.tokens,
             cached_tokens: hit.tokens,
             active_cached_tokens,
-        };
-        (cost, hit)
+        }
     }
 
     /// The whole-prompt blocks of `known_tokens` without a hit: what a grouped

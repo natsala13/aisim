@@ -16,6 +16,9 @@ use crate::engine::cache::vllm_block_pool::{
 };
 use crate::engine::common::hashing::SequenceHash;
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GroupedLease {
@@ -135,6 +138,9 @@ pub(crate) struct GroupStateLease {
 pub(crate) struct GroupedBlockPool {
     pool: VllmBlockPool,
     page_size_bytes: u64,
+    /// Unique among the pools of the process, so that a residency stamp of
+    /// one pool never matches another pool.
+    id: u64,
     /// The most active blocks seen since the last reset, for tests that
     /// observe a step's peak after the step.
     #[cfg(test)]
@@ -142,6 +148,13 @@ pub(crate) struct GroupedBlockPool {
 }
 
 impl GroupedBlockPool {
+    /// The pool and the generation of its resident keys. Two equal values
+    /// mean the same pool with the same set of resident keys, so every
+    /// `key_hit(..).is_some()` gives the same answer.
+    pub(crate) fn residency(&self) -> (u64, u64) {
+        (self.id, self.pool.grouped_key_generation())
+    }
+
     pub(crate) fn capacity_blocks(&self) -> usize {
         self.pool.capacity()
     }
@@ -299,6 +312,7 @@ impl GroupedKvPool {
             mode: GroupedMode::Blocks(GroupedBlockPool {
                 pool,
                 page_size_bytes,
+                id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
                 #[cfg(test)]
                 peak_active_blocks: std::cell::Cell::new(0),
             }),

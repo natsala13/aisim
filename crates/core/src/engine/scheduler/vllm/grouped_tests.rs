@@ -12,6 +12,7 @@ use crate::engine::trace::TraceCollector;
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
 
 use super::core::VllmCore;
+use super::request::RequestKvState;
 
 /// Decode queries `(active_tokens, mean_context, token_bound)` and prefill
 /// queries `(batch, new_tokens, prefix_tokens)`.
@@ -1239,4 +1240,139 @@ fn grouped_prefix_eviction_frees_cached_blocks_oldest_first() {
     // Request one is gone.
     let seventh = submit_tokens(&mut core, 807, (0..16).collect(), 1);
     assert_eq!(drain(&mut core, &mut trace, &mut step), vec![(seventh, 0)]);
+}
+
+/// A waiting request outside the core's queues, with the prefix hashes that
+/// the core gives a request it receives.
+fn waiting_probe(core: &VllmCore, id: u128, tokens: Vec<u32>) -> RequestKvState {
+    let mut probe = RequestKvState::native(
+        Uuid::from_u128(id),
+        tokens.clone(),
+        4,
+        4,
+        core.args.block_size,
+        true,
+        false,
+        false,
+        None,
+    );
+    probe
+        .lease
+        .configure_prefix_hashes(&tokens, core.args.prefix_match_unit.unwrap());
+    probe
+}
+
+/// The cached tokens that the waiting-loop lookup gives `probe`, checked
+/// against a fresh search of the same pool.
+fn waiting_hit(core: &VllmCore, probe: &mut RequestKvState) -> usize {
+    let lookup = core
+        .kv_manager
+        .lookup_native_prefill_cost(&probe.sequence, &mut probe.lease);
+    let fresh = core
+        .kv_manager
+        .get_native_prefill_cost(&probe.sequence, &probe.lease);
+    assert_eq!(
+        (
+            lookup.new_blocks,
+            lookup.cached_tokens,
+            lookup.active_cached_tokens
+        ),
+        (
+            fresh.new_blocks,
+            fresh.cached_tokens,
+            fresh.active_cached_tokens
+        )
+    );
+    lookup.cached_tokens
+}
+
+#[test]
+fn grouped_prefix_waiting_hit_follows_keys_that_enter_and_leave_the_pool() {
+    // One full-attention group of 4-token blocks in a pool of 16 blocks. A
+    // waiting request of 16 tokens is looked up in every step. Its hit must
+    // follow the pool: none, then the keys of a finished equal request, then
+    // none again once a long request evicts them.
+    for version in ["0.31.0", "0.32.0"] {
+        let mut full = group("full", 4, 8, None);
+        full.prefix_cacheable = Some(true);
+        let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
+        let mut trace = TraceCollector::default();
+        let mut step = 0;
+        let mut probe = waiting_probe(&core, 2001, (0..16).collect());
+        assert_eq!(waiting_hit(&core, &mut probe), 0, "{version}");
+        assert_eq!(waiting_hit(&core, &mut probe), 0, "{version}");
+        submit_tokens(&mut core, 2002, (0..16).collect(), 1);
+        drain(&mut core, &mut trace, &mut step);
+        // Capped below the prompt: (16 - 1) / 4 * 4 = 12.
+        assert_eq!(waiting_hit(&core, &mut probe), 12, "{version}");
+        assert_eq!(waiting_hit(&core, &mut probe), 12, "{version}");
+        // 64 new tokens take all 16 blocks and evict the four cached ones.
+        submit_tokens(&mut core, 2003, (1000..1064).collect(), 1);
+        drain(&mut core, &mut trace, &mut step);
+        assert_eq!(waiting_hit(&core, &mut probe), 0, "{version}");
+    }
+}
+
+#[test]
+fn grouped_prefix_waiting_hit_follows_the_state_keys_published_in_the_step() {
+    // A state key published in a step is no hit in that step
+    // (single:1726-1734). A 13-token request publishes its state at 12 in
+    // its one pass. A waiting 33-token request repeats it: between that pass
+    // and the next step its state lookup misses at 12, so it hits nothing.
+    // The next step clears the set, and the same request hits 12 tokens with
+    // no change of the resident keys.
+    for version in ["0.31.0", "0.32.0"] {
+        let mut core = fine_grained_core(version);
+        let mut trace = TraceCollector::default();
+        let mut probe = waiting_probe(&core, 2101, (0..33).collect());
+        assert_eq!(waiting_hit(&core, &mut probe), 0, "{version}");
+        submit_tokens(&mut core, 2102, (0..13).collect(), 1);
+        let pass = core.execute_pass(&mut trace, 0.0);
+        assert_eq!(pass.admissions.len(), 1, "{version}");
+        assert_eq!(waiting_hit(&core, &mut probe), 0, "{version}");
+        core.kv_manager.begin_step();
+        assert_eq!(waiting_hit(&core, &mut probe), 12, "{version}");
+    }
+}
+
+#[test]
+fn grouped_prefix_waiting_hit_follows_the_token_count_of_the_request() {
+    // The hit stops below the last known token (mgr:289-295). A waiting
+    // request of 8 tokens hits 4 of a cached 16-token prefix; one more token
+    // lifts the cap, and the same pool gives 8.
+    for version in ["0.31.0", "0.32.0"] {
+        let mut full = group("full", 4, 8, None);
+        full.prefix_cacheable = Some(true);
+        let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
+        let mut trace = TraceCollector::default();
+        let mut step = 0;
+        submit_tokens(&mut core, 2201, (0..16).collect(), 1);
+        drain(&mut core, &mut trace, &mut step);
+        let mut probe = waiting_probe(&core, 2202, (0..8).collect());
+        assert_eq!(waiting_hit(&core, &mut probe), 4, "{version}");
+        probe.generate_token();
+        assert_eq!(probe.len(), 9, "{version}");
+        assert_eq!(waiting_hit(&core, &mut probe), 8, "{version}");
+    }
+}
+
+#[test]
+fn grouped_prefix_waiting_hit_follows_new_prefix_hashes_of_the_request() {
+    // The prefix hashes are an input of the search. A waiting request that
+    // hits 12 tokens of a cached prefix hits nothing once its hashes are set
+    // from other tokens, with no change of the pool.
+    for version in ["0.31.0", "0.32.0"] {
+        let mut full = group("full", 4, 8, None);
+        full.prefix_cacheable = Some(true);
+        let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
+        let mut trace = TraceCollector::default();
+        let mut step = 0;
+        submit_tokens(&mut core, 2301, (0..16).collect(), 1);
+        drain(&mut core, &mut trace, &mut step);
+        let mut probe = waiting_probe(&core, 2302, (0..16).collect());
+        assert_eq!(waiting_hit(&core, &mut probe), 12, "{version}");
+        let other: Vec<u32> = (5000..5016).collect();
+        probe.lease.configure_prefix_hashes(&other, 4);
+        assert_eq!(waiting_hit(&core, &mut probe), 0, "{version}");
+    }
 }
