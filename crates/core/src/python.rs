@@ -8081,7 +8081,7 @@ mod tests {
                     "backend": "vllm", "num_gpu_blocks": 64, "block_size": 16,
                     "timing_model": {"type": "external", "provider": "aic", "config": {
                         "model": dir.path(), "system": "h200_sxm", "backend": "vllm",
-                        "backend_version": "0.24.0", "estimation_mode": "op_level",
+                        "backend_version": "current", "estimation_mode": "op_level",
                         "speculation": {"kind": "ngram", "params": {"num_speculative_tokens": 3}}
                     }}
                 }

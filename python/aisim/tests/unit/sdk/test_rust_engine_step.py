@@ -1516,6 +1516,7 @@ def test_nemotron_super_fp8_native_estimation_uses_packaged_moe_data() -> None:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("systems_order", ["packaged_only", "unavailable_last", "unavailable_first"])
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_nemotron_super_fp8_auto_degrades_to_hybrid_on_the_missing_mamba2_table(tmp_path, systems_order) -> None:
     """AISIM-2194: the SILICON op_level candidate misses the Mamba2 table; auto rebuilds it in HYBRID."""
     pytest.importorskip("aisim_core")
