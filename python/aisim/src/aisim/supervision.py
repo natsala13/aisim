@@ -493,6 +493,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         warn_old_keys(raw, args.command, source=args.config, file_raw=file_raw)
     event_output = None
     if raw is not None:
+        warmup = "repeated_prefixes" if config.traffic is None else config.traffic.load.agentic_warmup_policy
+        if args.overwrite and args.stack not in _BUILTIN_STACKS and warmup != "repeated_prefixes":
+            # Only the stack knows its warmup support; ask a supervised process before --overwrite removes outputs.
+            with tempfile.TemporaryDirectory(prefix="aisim-warmup-") as directory:
+                refusal = Path(directory) / "refusal"
+                command = [sys.executable, "-m", "aisim.resource_worker", "warmup-support", str(refusal), args.stack]
+                try:
+                    probe = run_process([*command, warmup], policy=policy)
+                except ResourceLimitError:
+                    probe = {}  # The execution run below reports the same limit.
+                if probe.get("status") == "cancelled":
+                    return 130
+                if probe.get("exit_code") == 2 and refusal.exists():
+                    parser.error(f"{args.config}: {refusal.read_text(encoding='utf-8')}")
         try:
             output = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
         except (OSError, ValueError) as exc:

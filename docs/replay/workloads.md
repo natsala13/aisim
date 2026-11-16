@@ -600,8 +600,10 @@ counts and latency distributions. Active partially warmed plays retain their
 identities and get a formal measurement origin at the barrier. An aborted live
 warmup has an empty formal cohort; its request ledger remains in
 `agentic_phases`. See [live trajectory warmup](agentic/warmup.md#live-trajectory-policy)
-for qualification boundaries. External stacks and SDK adapters must
-explicitly advertise `supports_agentic_live_warmup` and forward the policy.
+for qualification boundaries. The CLI rejects a stack that does not advertise
+the policy before `--overwrite` prepares the output directory; external stacks
+and SDK adapters must explicitly advertise `supports_agentic_live_warmup` and
+forward the policy.
 
 `agentic_warmup_policy: primers_only` models AIPerf's snapshot warmup when no
 cache-pressure warmup is configured: the live policy's primers, timed the same

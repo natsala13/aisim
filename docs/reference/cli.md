@@ -236,9 +236,10 @@ Specifically, overwrite may replace `prediction.json`, `recommendation.json`, `r
 `requests.jsonl`, `resource-plan.json`, `resource-runtime.json`, `execution-events.jsonl`,
 `afd-replay-spec.json`, `afd-qualification.json`, and numbered `recommendations/NNNN.yaml` files.
 Other files, including non-numbered files inside `recommendations/`, are preserved. Invalid
-configuration loading, overrides, core-schema validation, unknown top-level sections, and stacks or
-output adapters that are not installed leave existing artifacts intact. Errors raised while
-importing an installed plugin or inside an adapter occur after the known outputs are removed.
+configuration loading, overrides, core-schema validation, unknown top-level sections, stacks or
+output adapters that are not installed, and agentic warmup policies that the stack does not
+advertise leave existing artifacts intact. Errors raised while importing an installed plugin or
+inside an adapter occur after the known outputs are removed.
 
 For `engine.ais_perf_model`, an entry key that is not a perf-model field is a validation error, so
 existing artifacts stay. A key written twice inside `engine.ais_perf_model` in the configuration

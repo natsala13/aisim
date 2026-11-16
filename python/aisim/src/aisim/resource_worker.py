@@ -36,6 +36,19 @@ def main() -> int:
         from .main import main as _main
 
         return _main(sys.argv[2:])
+    if command == "warmup-support":
+        from .stack import resolve_runner_factory
+
+        try:
+            capabilities = resolve_runner_factory(sys.argv[3]).capabilities()
+        except Exception:
+            return 1  # The execution process reports stack errors in their usual order.
+        try:
+            capabilities.require_agentic_warmup_policy(sys.argv[4])
+        except ValueError as exc:
+            Path(sys.argv[2]).write_text(str(exc), encoding="utf-8")
+            return 2
+        return 0
     if command != "recommend":
         raise ValueError("invalid private execution command")
     root = Path(sys.argv[2])

@@ -3,6 +3,8 @@
 
 import json
 import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -226,7 +228,7 @@ class ReachedExecution(Exception):
     pass
 
 
-def supervise_warmup_prediction(tmp_path, monkeypatch, policy, *extra):
+def supervise_warmup_prediction(tmp_path, monkeypatch, policy, *extra, probe=None):
     from aisim import cli_args, supervision
 
     raw = {
@@ -241,11 +243,13 @@ def supervise_warmup_prediction(tmp_path, monkeypatch, policy, *extra):
     monkeypatch.setattr(cli_args, "_load_mapping", lambda _: raw)
     monkeypatch.setattr(supervision, "_installed_names", lambda _: ["legacy"])
 
-    def observe_run(*args, **kwargs):
+    def observe_run(command, **kwargs):
+        if "warmup-support" in command:
+            return probe or {"status": "completed", "exit_code": 0}
         raise ReachedExecution
 
     monkeypatch.setattr(supervision, "run_process", observe_run)
-    supervision.main(
+    return supervision.main(
         [
             "predict",
             "--config",
@@ -274,6 +278,14 @@ def test_supervisor_rejects_online_warmup_before_overwrite(tmp_path, monkeypatch
         supervise_warmup_prediction(tmp_path, monkeypatch, policy, "--online")
     assert exc.value.code == 2
     assert f"{policy} requires offline execution" in capsys.readouterr().err
+    assert prior.read_bytes() == b"previous valid results\n"
+
+
+def test_supervisor_stops_when_the_warmup_probe_is_cancelled(tmp_path, monkeypatch):
+    prior = tmp_path / "prediction.json"
+    prior.write_bytes(b"previous valid results\n")
+    cancelled = {"status": "cancelled", "exit_code": None}
+    assert supervise_warmup_prediction(tmp_path, monkeypatch, "live_trajectory_v1", probe=cancelled) == 130
     assert prior.read_bytes() == b"previous valid results\n"
 
 
@@ -342,9 +354,7 @@ class LoggingRunner:
         self.runner.close()
 
 
-def run_warmup_cli(tmp_path, monkeypatch, command, stack, policy):
-    from aisim import main as cli
-
+def warmup_cli_config(tmp_path, command, policy):
     fixtures = Path(__file__).parent / "e2e/configs/unified_cli/fixtures"
     raw = {
         "traffic": traffic(),
@@ -372,6 +382,13 @@ def run_warmup_cli(tmp_path, monkeypatch, command, stack, policy):
         raw["optimizer"] = {"algorithm": "random", "max_trials": 1, "parallelism": 1, "seed": 11}
     config = tmp_path / f"{command}.yaml"
     config.write_text(yaml.safe_dump(raw))
+    return config
+
+
+def run_warmup_cli(tmp_path, monkeypatch, command, stack, policy):
+    from aisim import main as cli
+
+    config = warmup_cli_config(tmp_path, command, policy)
     log = tmp_path / f"{stack}.log"
     monkeypatch.setattr(cli, "resolve_runner_factory", lambda name: WarmupStack(name == "advertising", log))
     argv = [command, "--stack", stack, "--config", str(config), "--output-dir", str(tmp_path / stack)]
@@ -403,6 +420,64 @@ def test_cli_runs_warmup_only_on_a_stack_that_advertises_it(tmp_path, monkeypatc
         run_warmup_cli(tmp_path, monkeypatch, command, "silent", policy)
     assert exc.value.code == 2
     assert f"before selecting {policy}" in capsys.readouterr().err
+
+
+def run_installed_stack(tmp_path, command, stack, policy):
+    (tmp_path / "warmup_stacks.py").write_text(
+        "from dataclasses import replace\n\n"
+        "from aisim.runner import EngineReplayRunnerFactory\n\n\n"
+        "class Silent(EngineReplayRunnerFactory):\n"
+        "    def capabilities(self):\n"
+        "        flags = {'supports_agentic_live_warmup': False, 'supports_agentic_primers_only': False}\n"
+        "        return replace(super().capabilities(), **flags)\n"
+    )
+    metadata = tmp_path / "warmup_stacks-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: warmup-stacks\nVersion: 1.0\n")
+    (metadata / "entry_points.txt").write_text(
+        "[aisim.runner_factories]\n"
+        "advertising = aisim.runner:EngineReplayRunnerFactory\n"
+        "silent = warmup_stacks:Silent\n"
+    )
+    output = tmp_path / "output"
+    (output / "recommendations").mkdir(parents=True)
+    original = {
+        "prediction.json": "old result",
+        "recommendation.json": "old result",
+        "recommendations/0001.yaml": "old config",
+        "resource-runtime.json": "old diagnostics",
+        "execution-events.jsonl": "old events\n",
+    }
+    for name, contents in original.items():
+        (output / name).write_text(contents)
+    config = warmup_cli_config(tmp_path, command, policy)
+    path = os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH"))))
+    result = subprocess.run(
+        [sys.executable, "-m", "aisim", command, "--config", str(config), "--stack", stack]
+        + ["--output-dir", str(output), "--overwrite", "--format", "json"],
+        env={**os.environ, "PYTHONPATH": path},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    outputs = {str(path.relative_to(output)): path.read_text() for path in output.rglob("*") if path.is_file()}
+    return result, original, outputs
+
+
+@pytest.mark.parametrize("policy", ["live_trajectory_v1", "primers_only"])
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_overwrite_keeps_outputs_when_the_installed_stack_lacks_the_policy(tmp_path, command, policy):
+    result, original, outputs = run_installed_stack(tmp_path, command, "silent", policy)
+    assert result.returncode == 2, result.stderr
+    assert f"before selecting {policy}" in result.stderr
+    assert outputs == original
+
+
+def test_overwrite_replaces_outputs_on_an_installed_stack_with_the_policy(tmp_path):
+    result, original, outputs = run_installed_stack(tmp_path, "predict", "advertising", "live_trajectory_v1")
+    assert result.returncode == 0, result.stderr
+    assert outputs["prediction.json"] != original["prediction.json"]
+    assert json.loads(outputs["resource-runtime.json"])["status"] == "completed"
 
 
 def test_supervisor_default_recommendation_without_traffic_keeps_existing_path(tmp_path, monkeypatch):
