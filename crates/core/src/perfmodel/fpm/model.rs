@@ -899,7 +899,13 @@ impl ForwardPassPerfModel {
                 last_error = Some(error);
                 continue;
             }
-            if let Some(speculation) = &config.speculation {
+            // An explicit vLLM regression prices MTP as the depth it was fitted at.
+            if let Some(speculation) = &config.speculation
+                && !(mode == EstimationMode::FpmRegression
+                    && config.estimation_mode == mode
+                    && config.backend == crate::BackendKind::Vllm
+                    && speculation.kind == "mtp")
+            {
                 if mode != EstimationMode::OpLevel {
                     let error = AicError::UnsupportedModel(format!(
                         "{} speculation requires op_level timing",

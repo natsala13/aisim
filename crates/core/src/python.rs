@@ -995,7 +995,6 @@ impl AicTimingModel {
             .provenance()
             .context("canonical estimator omitted construction provenance")?;
         config.backend_version = provenance.config.backend_version.clone();
-        config.nextn = provenance.config.nextn;
         config.speculation = provenance.config.speculation.clone();
         // Canonical construction validates and resolves cost identity first;
         // executor-specific width limits must not reclassify loader failures.
@@ -1079,9 +1078,9 @@ impl AicTimingModel {
     /// work the iteration query cannot describe is rejected here: a vision
     /// tower, speculative decoding other than the MTP rounds a vLLM regression
     /// was fitted to, and bounded decoder replay. Such a regression pins its
-    /// `nextn`, which the scheduler's `aic_nextn` must match; it takes an MTP
-    /// scheme as that `nextn`. Only vLLM's telemetry gives an MTP decode
-    /// request its verification width as extend.
+    /// depth, `nextn` or an MTP scheme's, which the scheduler's `aic_nextn`
+    /// must match. Only vLLM's telemetry gives an MTP decode request its
+    /// verification width as extend.
     fn require_fitted_role(
         config: &AicTimingConfig,
         mode: EstimationMode,
@@ -1092,7 +1091,6 @@ impl AicTimingModel {
             "{} cannot time a rank hosting the vision encoder; it prices only language-model iterations",
             wire_name(mode)
         );
-        // An MTP scheme is priced as the `nextn` of its depth.
         require_fitted_execution(
             mode,
             &config.backend,
@@ -1100,8 +1098,7 @@ impl AicTimingModel {
             config
                 .speculation
                 .as_ref()
-                .map(|speculation| speculation.kind.as_str())
-                .filter(|kind| *kind != "mtp"),
+                .map(|speculation| speculation.kind.as_str()),
             config.decoder_replay,
         )
     }
@@ -7587,8 +7584,9 @@ mod tests {
             AicTimingModel::build(&mut legacy, ForwardPassWorkerType::Decode, false).unwrap();
         let scheme_timing =
             AicTimingModel::build(&mut scheme, ForwardPassWorkerType::Decode, false).unwrap();
-        // Replay continues at the snapshot's nextn and prices every pass alike.
-        assert_eq!((scheme.nextn, scheme.speculation), (2, None));
+        // The scheme keeps its spelling, and every pass is priced alike.
+        assert_eq!(scheme.nextn, 0);
+        assert_eq!(scheme.speculation.as_ref().unwrap().kind, "mtp");
         let mut rank = fitted_work(0, None, Some(&[700, 900]));
         rank.decode.as_mut().unwrap().verify_width = 3;
         assert_eq!(
@@ -7602,6 +7600,78 @@ mod tests {
         assert!(
             format!("{error:#}").contains("differs from the snapshot's pinned identity at nextn")
         );
+    }
+
+    #[test]
+    fn fitted_mtp_role_takes_its_depth_from_the_scheme_with_or_without_a_cpu_tier() {
+        use crate::engine::NativeHostOffloadConfig;
+        pyo3::prepare_freethreaded_python();
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = unknown_regression_identity(ForwardPassWorkerType::Aggregated);
+        identity.nextn = 2;
+        let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
+        model
+            .tune_with_fpms(&fitted_training_iterations(
+                &[
+                    IterationKind::Prefill,
+                    IterationKind::Decode,
+                    IterationKind::Mixed,
+                ],
+                false,
+            ))
+            .unwrap();
+        let mut timing = serde_json::to_value(
+            model
+                .save_state_snapshot(
+                    dir.path().join("snapshot"),
+                    &crate::StateSnapshotOptions::default(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        timing["nextn"] = 0.into();
+        timing["speculation"] = serde_json::json!({"kind": "mtp", "params": {"depth": 2}});
+        for depth in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(2)),
+        ] {
+            for cpu_tier in [false, true] {
+                let mut value = serde_json::json!({
+                    "rank": {
+                        "backend": "vllm", "num_gpu_blocks": 64, "block_size": 16,
+                        "aic_nextn_accept_rates": "1,1",
+                        "timing_model": {"type": "external", "provider": "aic", "config": timing}
+                    }
+                });
+                if let Some(depth) = depth.clone() {
+                    value["rank"]["aic_nextn"] = depth;
+                }
+                let mut role: ReplayRoleConfig = serde_json::from_value(value).unwrap();
+                if cpu_tier {
+                    role.rank.native_host_offload = Some(NativeHostOffloadConfig::new(4));
+                }
+                resolve_role_timing(
+                    &mut role,
+                    true,
+                    ForwardPassWorkerType::Aggregated,
+                    None,
+                    false,
+                    &mut Vec::new(),
+                    &mut serde_json::Map::new(),
+                )
+                .unwrap()
+                .0
+                .unwrap();
+                assert_eq!(role.rank.aic_nextn, Some(2));
+                // The resolved identity keeps the scheme the CPU tier requires.
+                role.rank.validate_host_offload_speculation().unwrap();
+                let TimingModelConfig::External { config, .. } = &role.rank.timing_model else {
+                    panic!("the role keeps its AIC timing");
+                };
+                assert_eq!(config["speculation"]["kind"], "mtp");
+            }
+        }
     }
 
     #[test]

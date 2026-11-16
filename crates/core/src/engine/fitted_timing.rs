@@ -90,10 +90,11 @@ impl FittedIterationTiming {
             ));
         }
         let resolved = &provenance.config;
+        let depth = resolved.regression_depth()?;
         require_fitted_execution(
             mode,
             resolved.backend.as_str(),
-            resolved.nextn > 0,
+            depth > 0,
             resolved
                 .speculation
                 .as_ref()
@@ -102,7 +103,7 @@ impl FittedIterationTiming {
         )?;
         let worker_type = resolved.worker_type;
         let attention_dp = resolved.attention_dp;
-        let verify_width = resolved.nextn as usize + 1;
+        let verify_width = depth as usize + 1;
         require_iteration_stores(&model, worker_type, attention_dp)?;
         let detail = model.reads_request_detail();
         Ok(Self {
@@ -379,9 +380,9 @@ pub(crate) fn detailed_rank_metrics(
 }
 
 /// Require execution a regression or learned `mode` estimator can price
-/// through its iteration query: no speculation scheme other than MTP, which
-/// the caller passes as `nextn`; `nextn > 0` only for a vLLM regression (which
-/// pins the `nextn` it was fitted at); and no bounded decoder replay.
+/// through its iteration query: no speculation scheme but MTP, speculative
+/// rounds (`nextn > 0` or MTP) only for a vLLM regression (which pins the
+/// depth it was fitted at), and no bounded decoder replay.
 pub(crate) fn require_fitted_execution(
     mode: EstimationMode,
     backend: &str,
@@ -393,10 +394,10 @@ pub(crate) fn require_fitted_execution(
         !nextn_positive || (mode == EstimationMode::FpmRegression && backend == "vllm");
     let mode = wire_name(mode);
     ensure!(
-        nextn_priced && speculation_kind.is_none_or(|kind| kind == "none"),
+        nextn_priced && speculation_kind.is_none_or(|kind| matches!(kind, "none" | "mtp")),
         "{mode} replay does not support speculative decoding here: speculation schemes other \
          than MTP are rejected, and nextn > 0 or MTP is priced only by a vLLM fpm_regression \
-         snapshot, at the nextn it was fitted at"
+         snapshot, at the depth it was fitted at"
     );
     ensure!(
         !decoder_replay,

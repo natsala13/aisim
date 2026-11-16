@@ -285,9 +285,11 @@ total past KV, widens the former and preserves the latter.
 
 The canonical constructor currently supports explicit speculative schemes with
 OP/SOL timing. FPM interpolation and regression are unsupported candidates for
-these schemes, except that an explicit `fpm_regression` request takes an MTP
-scheme as the legacy `nextn` of its depth (see
-[engine replay timing](#engine-replay-timing)). An explicit FPM request with `fallback_policy="deny"` fails;
+these schemes, except that an explicit vLLM `fpm_regression` request prices an
+MTP scheme at the depth it was fitted at (see
+[engine replay timing](#engine-replay-timing)) and is selected as for legacy
+`nextn`. Otherwise an explicit FPM request with
+`fallback_policy="deny"` fails;
 `auto` or an explicit mode with `fallback_policy="allow"` can select a supported
 OP candidate while preserving the complete speculative identity. They do not
 drop speculation to obtain an autoregressive estimate. Separately, an ordinary
@@ -865,9 +867,8 @@ training timings cover complete MTP rounds, drafting and verification, as a
 measured speculative-round profile's do; `nextn` records the depth, not how
 the timings were obtained. Replay times such a role only at that depth:
 the snapshot pins `nextn`, and the engine's `aic_nextn` must equal it. An MTP
-draft is `depth` extra target-shaped layers, so an explicit `fpm_regression`
-configuration stores `speculation: {kind: mtp, params: {depth: N}}` as
-`nextn: N`, and the snapshot also times an engine configured with that scheme. Each
+draft is `depth` extra target-shaped layers, so the snapshot also times an
+engine configured with `speculation: {kind: mtp, params: {depth: N}}`. Each
 decode request counts once in the totals with its past KV, as in the
 telemetry; only its `extend_lengths` entry carries the tokens it verifies: one
 plus the drafts the scheduler gave it, fewer than `nextn` when the token budget
@@ -882,8 +883,9 @@ is not modeled), so it does not. Every aggregated worker whose engine runs
 attention DP above one also needs cross-rank aggregated. A regression store is
 ready with a usable fit and a learned store when the forest has it. It rejects
 a rank hosting the vision encoder, a speculation scheme other than MTP,
-`nextn > 0` or MTP for a learned model or a non-vLLM regression (SGLang's telemetry reports an MTP
-decode request's extend as 1), bounded decoder replay, and an automatic selection that
+`nextn > 0` or MTP for a learned model or a non-vLLM regression (SGLang's
+telemetry reports an MTP decode request's extend as 1), bounded decoder replay,
+and an automatic selection that
 would fall back to an untrained regression. Replay also rejects such a role
 whose engine sets a `decode_speedup_ratio` other than 1: replay then prices
 each rank's phases, which these estimators never do. A pass on which no rank

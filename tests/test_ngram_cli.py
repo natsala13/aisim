@@ -488,7 +488,7 @@ _MTP = {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5}
 @pytest.mark.parametrize(
     ("mode", "speculation"),
     [
-        # fpm_regression takes an MTP scheme as its nextn instead; see test_recommend_state_snapshot.py.
+        # A vLLM fpm_regression times an MTP scheme instead; see test_recommend_state_snapshot.py.
         ("fpm_interpolation", _MTP),
         ("fpm_interpolation", _SPEC),
         ("fpm_regression", _SPEC),

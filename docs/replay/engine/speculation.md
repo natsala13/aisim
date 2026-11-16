@@ -98,7 +98,8 @@ configuration required by the scheme. Standalone `draft_model` still requires
 its checkpoint path; retained `draft_config` does not replace checkpoint access.
 Scheme-specific model and backend checks remain unchanged. Explicit MTP is
 rejected for Kimi-K3 (`KimiK3ForConditionalGeneration`), the architecture in the
-DSPARK capability gate. MiniMax EAGLE3 remains unsupported.
+DSPARK capability gate; the gate covers OP timing, not a regression fitted to
+measured rounds. MiniMax EAGLE3 remains unsupported.
 Selecting a scheme does not override these model-family gates.
 
 Replay uses the existing NextN executor for a linear chain of 1–5 draft tokens.

@@ -584,6 +584,16 @@ impl ForwardPassPerfModelConfig {
         candidates
     }
 
+    /// The speculative depth a regression prices: an MTP scheme's depth, else
+    /// legacy `nextn`. An MTP draft is `depth` extra target-shaped layers, the
+    /// same identity as `nextn` (`aisim_core.sdk.speculation.mtp`).
+    pub(crate) fn regression_depth(&self) -> Result<u32, AicError> {
+        match &self.speculation {
+            Some(speculation) if speculation.kind == "mtp" => speculation.replay_depth(),
+            _ => Ok(self.nextn),
+        }
+    }
+
     /// Validate profile metadata and pin interpolation without constructing a
     /// graph or opening performance data. This also serves configuration-only
     /// consumers such as memory planning.
@@ -647,15 +657,6 @@ impl ForwardPassPerfModelConfig {
             .is_some_and(|spec| spec.kind == "none")
         {
             self.speculation = None;
-        }
-        // A regression pins the `nextn` it was fitted at. An MTP draft is
-        // `depth` extra target-shaped layers, the same as legacy `nextn`
-        // (`aisim_core.sdk.speculation.mtp`), so a regression takes it so.
-        #[cfg(feature = "python")]
-        if self.estimation_mode == EstimationMode::FpmRegression
-            && let Some(mtp) = self.speculation.take_if(|spec| spec.kind == "mtp")
-        {
-            self.nextn = crate::py::speculation_replay_depth(&mtp)?;
         }
         let registered = if self.fpm_profile.is_some() {
             self.estimator_config

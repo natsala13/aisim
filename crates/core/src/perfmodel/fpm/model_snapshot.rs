@@ -395,6 +395,7 @@ fn check_identity(
             .resolve()?
         }
     };
+    let (expected, base) = (mtp_as_nextn(expected)?, mtp_as_nextn(base)?);
     if expected != base {
         return Err(identity_mismatch(&expected, &base));
     }
@@ -408,6 +409,24 @@ fn check_identity(
         )));
     }
     Ok(())
+}
+
+/// A regression fitted at `nextn` N also restores for an MTP scheme of depth
+/// N, and one fitted with the scheme for `nextn` N, so identities compare with
+/// the scheme as its depth.
+fn mtp_as_nextn(
+    mut config: ForwardPassPerfModelConfig,
+) -> Result<ForwardPassPerfModelConfig, AicError> {
+    if config.estimation_mode == EstimationMode::FpmRegression
+        && config
+            .speculation
+            .as_ref()
+            .is_some_and(|speculation| speculation.kind == "mtp")
+    {
+        config.nextn = config.regression_depth()?;
+        config.speculation = None;
+    }
+    Ok(config)
 }
 
 /// First differing JSON path, for actionable identity-mismatch errors.

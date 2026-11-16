@@ -397,22 +397,27 @@ def test_checkpoint_resolution_classifies_only_recognized_availability_errors(mo
     assert attempted_paths == [path]
 
 
-def test_explicit_fpm_rejects_unimplemented_speculative_cost():
-    with pytest.raises(ValueError, match="speculat.*op_level|op_level.*speculat"):
-        RustForwardPassPerfModel.best_available(
-            _config(estimation_mode="fpm_interpolation", speculation={"kind": "mtp", "params": {"depth": 3}})
-        )
-
-
-def test_a_regression_takes_an_mtp_scheme_as_its_nextn():
-    resolved = RustForwardPassPerfModel.normalize_config(
-        _config(estimation_mode="fpm_regression", speculation={"kind": "mtp", "params": {"depth": 3}})
-    )
-    assert (resolved["nextn"], resolved["speculation"]) == (3, None)
-
-
 _MTP = {"kind": "mtp", "params": {"depth": 3}}
 _NGRAM = {"kind": "ngram", "params": {"num_speculative_tokens": 3}}
+
+
+@pytest.mark.parametrize(("mode", "backend"), [("fpm_interpolation", "vllm"), ("fpm_regression", "sglang")])
+def test_explicit_fpm_rejects_unimplemented_speculative_cost(mode, backend):
+    with pytest.raises(ValueError, match="speculat.*op_level|op_level.*speculat"):
+        RustForwardPassPerfModel.best_available(_config(estimation_mode=mode, backend=backend, speculation=_MTP))
+
+
+@pytest.mark.parametrize("fallback", ["deny", "allow"])
+def test_a_vllm_regression_keeps_an_mtp_scheme(fallback):
+    model = RustForwardPassPerfModel.best_available(
+        _config(estimation_mode="fpm_regression", fallback_policy=fallback, speculation=_MTP)
+    )
+    try:
+        resolved = model.diagnostics()["provenance"]
+        assert resolved["selected_estimation_mode"] == "fpm_regression"
+        assert (resolved["config"]["nextn"], resolved["config"]["speculation"]["params"]) == (0, _MTP["params"])
+    finally:
+        model.close()
 
 
 @pytest.mark.parametrize(

@@ -1930,8 +1930,7 @@ def _materialize_engine_role(
         ):
             timing_model = dict(timing_model)
             timing_config = dict(timing_model["config"])
-            # A resolved regression identity already holds an MTP scheme as its nextn.
-            if speculation is not None and (speculation.kind != "mtp" or timing_config.get("nextn") != nextn):
+            if speculation is not None:
                 cost_config = speculation.cost_config()
                 if timing_config.get("nextn") not in (None, 0):
                     raise ValueError("speculation conflicts with timing_model.config.nextn")
