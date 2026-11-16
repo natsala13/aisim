@@ -14,7 +14,9 @@ import yaml
 
 from aisim._legacy import plugin_entry_points
 
+from . import __version__
 from .detail import parse_detail_sections
+from .package_identity import DISTRIBUTION, program_name
 from .perf_model_cli import add_perf_model_parser
 from .support.cli import add_support_parser
 
@@ -39,9 +41,10 @@ def _positive_finite_float(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="aisim",
+        prog=program_name(),
         description="Predict or recommend an LLM serving configuration.",
     )
+    parser.add_argument("--version", action="version", version=f"{DISTRIBUTION} {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("predict", "recommend"):
         child = subparsers.add_parser(command)
@@ -78,9 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.choices["predict"].epilog = (
         "AgentX replay: use weka, agentic_mooncake, or agentic Dynamo traces with "
         "trace_timestamps and positive agentic_lanes. The offline engine stack supports "
-        "aggregated and P/D vLLM/SGLang with HBM-only KV cache, plus vLLM G2 on a static "
-        "single aggregated worker or 1P1D, with DP1 on every role. G2 supports canonical MTP only on "
-        "the aggregated worker with prefix caching and scope=dp_rank_local; other G2 speculation is unsupported. "
+        "aggregated and P/D vLLM/SGLang with HBM-only KV cache, plus vLLM G2 on static "
+        "aggregated or P/D pools with any positive integer worker count and DP1 on every role. G2 supports "
+        "canonical MTP only on a single aggregated worker with prefix caching and scope=dp_rank_local; "
+        "other G2 speculation is unsupported. "
         "HBM-only AgentX supports speculative decoding with explicit acceptance assumptions. "
         "agentic_snapshot selects seeded starts; agentic_warmup primes saved prefixes; "
         "agentic_profile enables duration controls on the offline engine stack; "

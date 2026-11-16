@@ -175,8 +175,18 @@ supported topologies. The external Dynamo Python adapter's diagnostics export
 requires separate qualification: native Rust compatibility aliases do not establish
 adapter parity. If a selected runner exports no typed evidence, energy details
 state that reason. Native AFD exports operation-energy evidence; numeric power
-depends on operation-energy coverage. FPM, fixed, polynomial, and analytical EPD
-energy remain unavailable; their summary fields are explicit nulls where unsupported.
+depends on operation-energy coverage. Native Replay and unified prediction keep
+FPM, fixed, polynomial, and analytical EPD energy unavailable; their `power_w`
+and `power_coverage` summary fields are explicit nulls where unsupported. This
+includes fully powered schema-8 FPM pairs. Separately, Python static FPM
+`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()` can return
+nonzero operation energy with SOL interpolation. Aggregated results retain
+pure-decode energy and suppress mixed-step energy. The SDK and legacy
+`aiconfigurator cli estimate` (`cli_estimate()`) publish `power_w` for static,
+aggregated, and disaggregated schema-8 FPM results when their latency-weighted
+coverage reaches 90%; below that gate they return null power with numeric
+`power_coverage`. See
+[FPM power](../perf-model/power.md).
 
 <a id="prediction-directory"></a>
 
@@ -260,8 +270,12 @@ the raw objective values in `objectives`. Use `recommendation.json` for the comp
 
 Normal prediction output includes timing provenance without `--detail`. The
 `prediction_provenance` summary maps each worker role to its effective `estimator`,
-`timing_source`, and `data_version`. Operation-level AIC timing reports the resolved
+`timing_source`, `data_version` and `database_mode`. Operation-level AIC timing reports the resolved
 performance-database backend version, including resolution of version aliases.
+`database_mode` is the selected performance-database mode of the `op_level` and
+`fpm_interpolation` estimators, for example `HYBRID` after automatic selection
+degraded a `SILICON` request over a missing linear-attention table; `fpm_regression`
+and `fpm_learned` report null, and fixed/polynomial timing omits the key.
 FPM estimators report the resolved profile revision as `data_version` and preserve
 the profile model/revision in `data_identity`. Without a profile revision, they
 report a null version with a reason. Fixed/polynomial timing also has no data
@@ -334,10 +348,13 @@ Memory without evidence is omitted from `details.sections` and listed with a rea
 section with only some estimated roles is `partial` and records
 why other roles are unavailable. Energy retains an explicit unavailable status and reason when
 the runner exports no typed evidence. Missing measurements are never invented as zero;
-energy-aware runs with no covered operations report numeric zero coverage. Whole-model FPM,
-fixed/polynomial timing, analytical EPD overlays, and adapters without the native export
-report operation timing/source evidence unavailable. Serving time statistics remain available
-where exported. See [diagnostic availability](../aic-backward-compatibility/migration.md#prediction-details-and-power).
+energy-aware runs with no covered operations report numeric zero coverage. Native Replay
+with whole-model FPM can report timing/source evidence while its energy details remain
+unsupported and unified `power_w`/`power_coverage` stay null. Python static FPM summary
+energy is a separate path. Fixed/polynomial timing, analytical EPD overlays, and adapters
+without the native export report operation timing/source evidence unavailable. Serving
+time statistics remain available where exported. See
+[diagnostic availability](../aic-backward-compatibility/migration.md#prediction-details-and-power).
 
 Inspect a recommendation by running `predict --detail` on its saved YAML. Reporting options
 are CLI-only; this change adds no YAML configuration fields.

@@ -9,6 +9,13 @@ import { test } from "node:test";
 import vm from "node:vm";
 
 const workflow = readFileSync(new URL("../.github/workflows/e2e-accuracy.yml", import.meta.url), "utf8");
+test("AgentX private and public uploads overwrite artifacts when jobs are retried", () => {
+  const branchWorkflow = readFileSync(new URL("../.github/workflows/e2e-accuracy-branch.yml", import.meta.url), "utf8");
+  const uploads = branchWorkflow.split(/\n      - /).filter(step => step.includes("actions/upload-artifact@") &&
+    (step.includes("name: agentx-private-") || step.includes("'e2e-agentx-preview'")));
+  assert.equal(uploads.length, 2);
+  for (const step of uploads) assert.match(step, /\n          overwrite: true\n/);
+});
 const source = workflow.match(/          script: \|\n((?:(?:            .*)?\n)+)/)[1];
 assert.match(source, /core\.setOutput\('matrix', JSON\.stringify\(\{include: entries\}\)\);\s*$/);
 const sha = "a".repeat(40);
@@ -121,7 +128,7 @@ const run = {
   head_repository: { full_name: "ai-dynamo/aisim" },
 };
 
-async function resolve({ event = "schedule", ref = "refs/heads/main", pr, runs = [run], built = true, expired = false, inputs = {}, branches = [] } = {}) {
+async function resolve({ event = "schedule", ref = "refs/heads/main", pr, runs = [run], built = true, expired = false, artifactName = "nightly-dist-amd64-manifest", inputs = {}, branches = [] } = {}) {
   const outputs = {};
   const actions = {
     listWorkflowRuns: async (args) => {
@@ -149,7 +156,7 @@ async function resolve({ event = "schedule", ref = "refs/heads/main", pr, runs =
         { name: "Stage artifacts", conclusion: null, status: "waiting" },
       ];
       assert.equal(method, "artifacts");
-      return [{ name: "nightly-dist-amd64", expired }];
+      return [{ name: artifactName, expired }];
     } },
   });
   await vm.runInContext(`(async () => { ${source} })()`, context);
@@ -161,7 +168,7 @@ test("scheduled accuracy reuses the exact main wheel while release staging waits
 });
 
 test("missing, failed, and expired nightly builds fall back to building the scheduled SHA", async () => {
-  for (const scenario of [{ runs: [] }, { built: false }, { expired: true }]) {
+  for (const scenario of [{ runs: [] }, { built: false }, { expired: true }, { artifactName: "nightly-dist-amd64" }]) {
     assert.deepEqual(await resolve(scenario), [entry("main", sha)]);
   }
 });
@@ -228,7 +235,7 @@ test("PR preview requires an exact trusted copy of the open same-repository PR",
   const pr = {state: "open", head: {sha, ref: branch, repo: {full_name: "ai-dynamo/aisim"}}};
   const args = {event: "workflow_dispatch", ref: "refs/heads/pull-request/372", pr,
     inputs: {PREVIEW: "true", EXPECTED_SHA: sha, EVALUATED_BRANCH: branch}};
-  assert.deepEqual(await resolve(args), [{...entry(branch, sha), preview: true}]);
+  assert.deepEqual(await resolve(args), [{...entry(branch, sha), preview: true, pr_number: "372"}]);
   for (const ref of ["refs/heads/main", "refs/heads/simonec/preview", "refs/heads/pull-request/bad"]) {
     await assert.rejects(resolve({...args, ref}), /exact trusted/);
   }
@@ -247,7 +254,7 @@ test("candidate and partial silicon inputs are restricted to pinned trusted prev
   const inputs = {PREVIEW: "true", EXPECTED_SHA: sha, EVALUATED_BRANCH: branch,
     AGENTX_REVISION: "b".repeat(40), AGENTX_CAMPAIGN_CATALOG: "catalog/e2e/agentx/qualifications/campaign.json"};
   const args = {event: "workflow_dispatch", ref: "refs/heads/pull-request/686", pr, inputs};
-  assert.deepEqual(await resolve(args), [{...entry(branch, sha), preview: true}]);
+  assert.deepEqual(await resolve(args), [{...entry(branch, sha), preview: true, pr_number: "686"}]);
   await assert.rejects(resolve({...args, inputs: {...inputs, AGENTX_REVISION: "refs/pr/7"}}), /immutable SHA/);
   await assert.rejects(resolve({...args, inputs: {...inputs, PREVIEW: "false"}}), /trusted preview/);
   for (const path of ["../outside.json", "https://outside.invalid/catalog.json", "catalog/e2e/agentx/qualifications/../catalog.json"]) {

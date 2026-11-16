@@ -464,6 +464,57 @@ are rejected before interpolation; the existing execution-identity and real-KV
 requirements still apply. The legacy `dynamo_native_single_sample_v1` contract
 is unchanged.
 
+Schema 8 adds vLLM self-benchmark power measurements while retaining schema 7's
+execution identity. Both the sidecar and every row must declare
+`measurement_policy: dynamo_native_single_sample_power_window_v1`. This policy
+is accepted only with schema 8 and backend `vllm`; missing, null, legacy, or
+unknown row policies are rejected.
+
+| Field | Schema-8 contract |
+|---|---|
+| `measurement_policy` | Required in the sidecar and every row; `dynamo_native_single_sample_power_window_v1` |
+| `power_w` | Required nullable Parquet DOUBLE (float64) column; mean watts per GPU from a separate power window of at least one second |
+| `latency_ms` | Single-sample forward latency in milliseconds, preserved independently of the power window |
+
+Every non-null `power_w` must be finite and greater than zero. Null records
+measured latency with unknown power; the Rust loader represents that power as
+NaN rather than inventing a zero-watt measurement. Schema 6 and 7 remain
+latency-only and do not read `power_w`. Fake-KV healing retains the selected
+anchor's power, including unknown power.
+
+With SOL interpolation, FPM forward operators return operation energy in
+watt-milliseconds from schema-8 row power and resolved latency. Latency and
+power use the same interpolation weight; a prefill latency clamp also scales
+energy. If any selected anchor lacks power, the operation returns zero energy
+as the uncovered-data sentinel. Direct interpolation stays latency-only.
+For example, a 500 W, 7 ms SOL result carries 3500 W·ms of operation energy.
+
+Python static summaries expose this energy through
+`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()`, which
+can now return nonzero FPM energy for schema-8 pairs. SDK and legacy
+`cli_estimate()` static, aggregated, and disaggregated results publish the
+resulting average `power_w` when coverage reaches 90%, and otherwise return null
+power with numeric `power_coverage`. Aggregated results combine zero-energy mixed
+steps with powered pure-decode steps, so their coverage counts mixed-step latency
+as uncovered. `Task.run_single_agg()` and `Task.run_single_disagg()` include
+numeric `power_coverage`; raw `InferenceSession` summaries expose coverage
+through `get_power_data_coverage()`. See the
+[power output contract](../power.md) for the other withholding rules; this
+operator change already affects these outputs for powered schema-8 pairs.
+Mixed steps suppress both FPM
+prefill and marginal-decode energy (decision D10, AISIM-2001), while retaining
+draft-operation energy. `FpmForwardOp::query_totals` returns SOL-based operation
+energy. `estimate_forward_pass_time_ms(metrics_by_rank)` returns latency only;
+its `ForwardPassMetrics` rank dispatch discards FPM energy. Native Replay's FPM
+timing provider also remains latency-only: replay and unified prediction reports keep
+`power_w` and `power_coverage` null even for a fully powered schema-8 pair. See
+the [power output contract](../power.md#publication-gate).
+
+The accuracy dataset gate validates the schema-8 policy, row binding, DOUBLE
+column, and power values before admitting a pair. Its Gym worker adapter still
+rejects schema 7 and 8 execution identities as unsupported; artifact validation
+does not establish predictor support or measured serving accuracy.
+
 For a Kimi K3 text profile, an explicit configuration can be:
 
 ```python

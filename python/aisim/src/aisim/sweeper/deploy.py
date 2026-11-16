@@ -14,6 +14,9 @@ from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_
 from ..config.engine import NgramSpeculationConfig, resolve_block_size
 from .replay import BackendDeploymentSpec, EncoderPoolSpec, ForwardPassEstimatorSpec
 
+# `--chunked-prefill-size` when SGLang is launched without one.
+SGLANG_DEFAULT_CHUNKED_PREFILL_SIZE = 8192
+
 
 def _role_prefix(role: str) -> str:
     """Field prefix in the unrolled sample for a role (empty for agg shape fields)."""
@@ -114,6 +117,13 @@ def _engine_args_payload(
     if role in ("agg", "prefill") and backend == "sglang":
         # Ahead of the capacity materialization below, which deducts the tower and cache.
         payload.update(_native_vl_engine_args(sample, role))
+        # As the compiler: SGLang chunks a prefill at the public token budget, in whole pages.
+        # A budget that lands on the scheduler's own default stays unwritten.
+        sglang = payload.get("sglang", {})
+        chunk = int(sglang.get("chunked_prefill_size", payload["max_num_batched_tokens"]))
+        chunk = max(int(block_size), chunk // int(block_size) * int(block_size))
+        if "chunked_prefill_size" in sglang or chunk != SGLANG_DEFAULT_CHUNKED_PREFILL_SIZE:
+            payload["sglang"] = {**sglang, "chunked_prefill_size": chunk}
     context_length = sample.get(f"{role}_context_length") or sample.get("context_length")
     if context_length is not None:
         payload["max_model_len"] = int(context_length)

@@ -31,7 +31,7 @@ from collector.fpm_forward.database import (
     write_formal_database,
 )
 from collector.fpm_forward.memory_admission import filter_memory_infeasible_topologies
-from collector.fpm_forward.model_capability import load_model_config
+from collector.fpm_forward.model_capability import ResolvedModelConfig, load_model_config
 from collector.fpm_forward.planner import (
     BackendPolicy,
     FPMCell,
@@ -1676,6 +1676,131 @@ def test_llm_config_markers_and_architecture_match_config_intake(tmp_path, decod
         model=str(directory), model_revision=None, architecture=intake.suggestions["architecture"]
     )
     _validate_checkpoint_architecture(profile)
+
+
+@pytest.mark.parametrize(
+    "key,inner,ambiguity",
+    [
+        ("text_config", "text_config", "ambiguous nested text_config"),
+        ("llm_config", "llm_config", "ambiguous nested llm_config"),
+        ("text_config", "llm_config", "ambiguous nested llm_config in text_config"),
+        ("llm_config", "text_config", "ambiguous nested text_config in llm_config"),
+    ],
+    ids=["text-in-text", "llm-in-llm", "llm-in-text", "text-in-llm"],
+)
+def test_decoder_that_nests_a_decoder_key_is_refused_as_config_intake_refuses_it(tmp_path, key, inner, ambiguity):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+
+    decoder = _packaged_config(_NEMOTRON_SUPER)
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"architectures": ["ExampleMultimodalForConditionalGeneration"], key: {**decoder, inner: decoder}})
+    )
+    with pytest.raises(ValueError) as intake:
+        load_intake_config(path)
+    assert str(intake.value) == f"{ambiguity}; supply one text decoder config or a complete --fpm-profile"
+    refusal = f"{ambiguity}; supply one text decoder config"
+    with pytest.raises(ValueError) as collector:
+        _layout_capability(path, native=True)
+    assert str(collector.value) == refusal
+    # Render reads the same view, so the parser fallback cannot read either decoder.
+    with pytest.raises(ValueError) as render:
+        load_model_config(str(path)).parsed_payload()
+    assert str(render.value) == refusal
+
+
+@pytest.mark.parametrize("key", ["text_config", "llm_config"])
+def test_null_inner_llm_config_is_not_a_decoder_for_the_collector_or_intake(tmp_path, key):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+
+    decoder = {**_packaged_config(_NEMOTRON_SUPER), "llm_config": None}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"architectures": ["ExampleMultimodalForConditionalGeneration"], key: decoder}))
+    intake = load_intake_config(path)
+    capability = _layout_capability(path, native=True)
+    assert intake.notes["decoder_config"] == f"config {key}; outer model and encoder geometry are excluded"
+    assert ", ".join(intake.runtime_layout) == _NEMOTRON_REASONS
+    assert capability.support_reason == (
+        f"config.json cannot describe this cache layout ({_NEMOTRON_REASONS}). The native runtime measures every cell."
+    )
+
+
+@pytest.mark.parametrize("text_config", [None, [], "decoder", {}], ids=["null", "list", "string", "empty-object"])
+def test_malformed_text_config_is_refused_as_config_intake_refuses_it(tmp_path, text_config):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+
+    # The wrapper's flat fields describe a valid decoder, so only the refusal keeps the collector off them.
+    document = {
+        **_packaged_config(_NEMOTRON_SUPER),
+        "architectures": ["ExampleMultimodalForConditionalGeneration"],
+        "text_config": text_config,
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    problem = "text_config must be a nonempty object describing one text decoder"
+    with pytest.raises(ValueError) as intake:
+        load_intake_config(path)
+    assert str(intake.value) == f"{problem}; supply its decoder config or a complete --fpm-profile"
+    refusal = f"{problem}; supply one text decoder config"
+    with pytest.raises(ValueError) as effective:
+        _ = ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload
+    assert str(effective.value) == refusal
+    with pytest.raises(ValueError) as collector:
+        _layout_capability(path, native=True)
+    assert str(collector.value) == refusal
+    # Render reads the same view, so the parser fallback cannot read the wrapper's flat fields.
+    with pytest.raises(ValueError) as render:
+        load_model_config(str(path)).parsed_payload()
+    assert str(render.value) == refusal
+
+
+@pytest.mark.parametrize("llm_config", [None, {}, "decoder", []], ids=["null", "empty-object", "string", "list"])
+def test_malformed_llm_config_of_a_registered_wrapper_is_refused_as_config_intake_refuses_it(tmp_path, llm_config):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+    from aisim_core.sdk.fpm_profile import _validate_checkpoint_architecture
+
+    # The registry maps this wrapper to llm_config, so the key holds its decoder whenever it is present. The wrapper's
+    # flat fields describe a valid decoder, so only the refusal keeps the readers off them.
+    wrapper = "NemotronH_Omni_Reasoning_V3"
+    document = {**_packaged_config(_NEMOTRON_SUPER), "architectures": [wrapper], "llm_config": llm_config}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    problem = "llm_config must be a nonempty object describing one text decoder"
+    with pytest.raises(ValueError) as intake:
+        load_intake_config(path)
+    assert str(intake.value) == f"{problem}; supply its decoder config or a complete --fpm-profile"
+    with pytest.raises(ValueError) as effective:
+        _ = ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload
+    assert str(effective.value) == f"{problem}; supply one text decoder config"
+    profile = SimpleNamespace(model=str(tmp_path), model_revision=None, architecture=wrapper)
+    with pytest.raises(ValueError) as check:
+        _validate_checkpoint_architecture(profile)
+    identity = f"{str(tmp_path)!r} at model_revision=None"
+    assert str(check.value) == (
+        f"FPM profile checkpoint config.json for {identity} has no single text decoder: {problem}"
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"llm_config": None}, {"llm_config": {}}, {"llm_config": []}, {"llm_config": "decoder"}],
+    ids=["flat", "null-llm-config", "empty-llm-config", "list-llm-config", "string-llm-config"],
+)
+def test_flat_config_and_an_llm_config_that_is_no_decoder_load_in_the_collector_and_intake(tmp_path, extra):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+
+    document = {**_packaged_config(_NEMOTRON_SUPER), **extra}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    intake = load_intake_config(path)
+    assert "decoder_config" not in intake.notes
+    assert ", ".join(intake.runtime_layout) == _NEMOTRON_REASONS
+    # No decoder key is held, so the collector reads the config itself.
+    assert ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload == document
+    assert _layout_capability(path, native=True).support_reason == (
+        f"config.json cannot describe this cache layout ({_NEMOTRON_REASONS}). The native runtime measures every cell."
+    )
+    assert load_model_config(str(path)).parsed_payload()["raw_config"]["architectures"] == document["architectures"]
 
 
 def _detected_layout_plan(tmp_path, monkeypatch, generator_overrides):
@@ -3602,8 +3727,12 @@ def test_v41_cached_prefill_requires_real_computed_state(tmp_path, marker):
     if marker == "kvwarm_real_kv":
         assert aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")[0]["kv_seed_regime"] == "real_kv"
     else:
-        with pytest.raises(ValueError, match="requires real_kv"):
+        regime = {"kvwarm_fake_fallback": "fake_fallback", None: "legacy"}[marker]
+        with pytest.raises(ValueError) as error:
             aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+        assert str(error.value) == (
+            f"execution-identity cells require real KV measurements for cached prefill and decode, got {regime}"
+        )
 
 
 @pytest.mark.parametrize("mode", [None, "PIECEWISE", "FULL", False])
@@ -3615,7 +3744,7 @@ def test_v41_reader_rejects_unqualified_graph_or_missing_execution_mode(tmp_path
     identity = ("c" * 64, "full", "hbm_tp_sharded", "text")
     cell = SimpleNamespace(execution_identity=identity)
     payload = {"execution_identity": dict(zip(EXECUTION_COLUMNS, identity, strict=True)), "execution_mode": mode}
-    with pytest.raises(ValueError, match="verified eager"):
+    with pytest.raises(ValueError, match="unaudited execution mode"):
         _validate_execution_provenance(cell, payload, tmp_path / "rank.json")
 
 
@@ -3643,19 +3772,98 @@ def test_v41_auto_eager_rejects_capture_requests(graph_args):
         options.resolve_model_execution("DeepseekV41ForCausalLM")
 
 
-@pytest.mark.parametrize("v41,eager", [(True, False), (False, True)])
-def test_explicit_eager_collection_admission(v41, eager, monkeypatch):
-    from collector.fpm_forward import planner
-
-    monkeypatch.setattr(planner, "execution_identity", lambda *args, **kwargs: ("c" * 64 if v41 else "",))
-    with pytest.raises(ValueError, match="eager"):
+def test_explicit_eager_collection_admission():
+    with pytest.raises(ValueError) as error:
         build_collection_plan(
             backend="vllm",
             model_path="nvidia/GLM-5.2-NVFP4",
             system="b200_sxm",
             selected_ops={"dsa_context_module", "dsa_generation_module"},
-            options=FPMCollectionOptions.from_args(_args(fpm_enforce_eager=eager)),
+            options=FPMCollectionOptions.from_args(_args(fpm_enforce_eager=True)),
         )
+    assert str(error.value) == "explicit eager FPM collection is currently qualified only for DeepSeek V4.1"
+
+
+def test_glm_plan_accepts_graph_timing_and_refuses_eager(tmp_path):
+    from collector.fpm_forward.config import _freeze_benchmark_points
+
+    from .test_fpm_runtime_memory import _glm_plan
+
+    architecture = "Glm5NextForConditionalGeneration"
+    path = _mixed_attention_config(tmp_path, architecture, True)
+    # These plans bring their own GLM point list. Without an accepted profile the planner cannot generate one.
+    points = tmp_path / "points.json"
+    points.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "prefill": [{"batch_size": 1, "total_prefill_tokens": 64, "total_kv_read_tokens": 0}],
+                "decode": [{"batch_size": 1, "total_kv_read_tokens": 4096}],
+            }
+        )
+    )
+
+    def build(**overrides):
+        return build_collection_plan(
+            backend="vllm",
+            model_path=str(path),
+            system="b200_sxm",
+            selected_ops={"attention_context", "attention_generation"},
+            options=FPMCollectionOptions.from_args(_args(**{"fpm_benchmark_points_file": str(points), **overrides})),
+            model_architecture=architecture,
+            has_model_cases=False,
+            model_config_path=str(path),
+            collector_config={"aic_database_version": "0.27.0"},
+        )
+
+    # The accepted profile names the model revision that vLLM and the producer load.
+    points_json, points_sha256 = _freeze_benchmark_points(str(points))
+    plan = _glm_plan(tmp_path, benchmark_points_json=points_json, benchmark_points_sha256=points_sha256)
+
+    assert plan.options.enforce_eager is False
+    assert "enforce_eager" not in plan.to_dict()["options"]
+    # A user list keeps its explicit meaning.
+    assert plan.to_dict()["point_generation"]["source"] == "frozen_explicit_manifest"
+    digest = plan.cells[0].execution_identity[0]
+    assert len(digest) == 64
+    assert set(digest) <= set("0123456789abcdef")
+    # GLM seeds its own tokens, so its cells do not depend on the DeepSeek V4.1 text corpus.
+    assert {cell.input_text_sha256 for cell in plan.cells} == {""}
+    with pytest.raises(ValueError) as error:
+        build(fpm_enforce_eager=True)
+    assert str(error.value) == "explicit eager FPM collection is currently qualified only for DeepSeek V4.1"
+    with pytest.raises(ValueError) as error:
+        build(fpm_benchmark_points_file=None)
+    assert str(error.value) == "GLM-5.3-Flash collection requires the accepted profile's hash_block_size_tokens"
+    # Without an accepted profile or probe launch, the plan has no revision to load.
+    with pytest.raises(ValueError) as error:
+        build()
+    assert str(error.value) == (
+        "GLM-5.3-Flash collection requires a model revision of 40 lowercase hex characters, got None"
+    )
+
+
+def test_deepseek_v41_plan_keeps_its_eager_rule():
+    def build(**overrides):
+        return build_collection_plan(
+            backend="vllm",
+            model_path="deepseek-ai/DeepSeek-V4.1-Flash",
+            system="b200_sxm",
+            selected_ops={"attention_context", "attention_generation"},
+            options=FPMCollectionOptions.from_args(_args(**overrides)),
+            model_architecture="DeepseekV41ForCausalLM",
+            has_model_cases=False,
+            collector_config={"aic_database_version": "0.27.0"},
+        )
+
+    corpus = Path(__file__).parents[3] / "collector/fpm_forward/runtime/fpm_text.txt"
+    plan = build(fpm_enforce_eager=True)
+
+    assert plan.options.enforce_eager is True
+    assert plan.to_dict()["options"]["enforce_eager"] is True
+    assert {cell.input_text_sha256 for cell in plan.cells} == {hashlib.sha256(corpus.read_bytes()).hexdigest()}
+    with pytest.raises(ValueError, match="DeepSeek V4.1 requires eager execution"):
+        build()
 
 
 @pytest.mark.parametrize("corruption", ["missing", "tampered", "fake", "seed", "path", "coverage"])

@@ -11,7 +11,7 @@ queries, Replay feature support, and measured accuracy are separate results.
 
 | Path | Required evidence | Coverage boundary |
 | --- | --- | --- |
-| `op_level` + `SILICON` | Registered graph and required collected operation data | A model can construct while a later shape lacks data. Analytical-only operations retain their own source labels. |
+| `op_level` + `SILICON` | Registered graph and required collected operation data | A model can construct while a later shape lacks data. Analytical-only operations retain their own source labels. Linear-attention operations (Mamba2, GDN, KDA) require a table with rows for each kernel the model runs; a missing table or kernel is a construction miss, and only the other modes keep their analytic estimate; a kernel whose rows do not cover the model's per-shard shape prices at the analytic estimate labeled `sol`, as in the other modes. |
 | `op_level` + `HYBRID` / `EMPIRICAL` | Applicable analytical operations and permitted calibration/transfer slices | A transfer is an estimate, not a newly measured cell. Missing calibration remains an error. |
 | `op_level` + `SOL` | Analytical operation and system specifications | Lower-bound modeling does not certify a serving runtime or kernel accuracy. |
 | `fpm_interpolation`, `method: direct` | Verified architecture metadata, resource profile, genuine phase measurements | Exact identity and measured brackets; no out-of-domain extrapolation or analytical graph. |
@@ -66,12 +66,18 @@ quantization recipe. Its routed experts are NVFP4. Its Gated DeltaNet (GDN)
 projections and its shared-expert projections are static per-tensor FP8, and
 its KV cache is FP8. AISim prices those projections as `fp8_static`, the
 routed experts as `nvfp4`, and the router, shared-expert gate and LM-head
-GEMMs in BF16, as the export stores them. Two lanes are approximations. The
-export keeps the GDN `in_proj_a` and `in_proj_b` projections in BF16, but
-AISim prices them with the other GDN projections as `fp8_static`. The
-export also keeps its multi-token prediction (MTP) layer in BF16. With
-`nextn` above zero, AISim scales the decode graph by `(nextn + L) / L`
-for `L` decoder layers, so it prices that layer with the decoder-layer lanes.
+GEMMs in BF16, as the export stores them. The export keeps the GDN
+`in_proj_a` and `in_proj_b` projections in BF16, and AISim prices their
+fused `in_proj_ba` GEMM in BF16 too. The bundled Qwen3.6 NVFP4 exports leave
+the same two projections out of their quantized layers, and a targets-only
+MIXED_PRECISION export (one whose header declares no base precision lane)
+leaves an unlisted module unquantized, so AISim prices that GEMM in BF16
+for them as well. An export that keeps a base lane, such as `quant_method: fp8`
+with a block size, quantizes its unlisted non-expert GEMMs through that lane
+instead. The remaining approximation is the MTP layer. The export
+keeps its multi-token prediction (MTP) layer in BF16. With `nextn` above zero,
+AISim scales the decode graph by `(nextn + L) / L` for `L` decoder
+layers, so it prices that layer with the decoder-layer lanes.
 
 ## Published FPE matrix
 

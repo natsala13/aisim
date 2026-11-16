@@ -122,6 +122,7 @@ def _language_execution(spec: ReplaySpec) -> dict:
     from aisim_core.sdk.perf_database import get_latest_database_version, resolve_query_version
 
     from ..runner import _materialize_engine_role
+    from ..sweeper.deploy import SGLANG_DEFAULT_CHUNKED_PREFILL_SIZE
     from ..sweeper.forward_pass_estimator import resolve_systems_paths
     from .engine import EstimatorPolicyConfig, SchedulerPredictionConfig
 
@@ -140,6 +141,9 @@ def _language_execution(spec: ReplaySpec) -> dict:
         rank = engine["rank"]
         rank.setdefault("prefill_schedule_interval", SchedulerPredictionConfig().prefill_schedule_interval)
         rank.setdefault("prefill_decode_interval", SchedulerPredictionConfig().prefill_decode_interval)
+        if deployment.backend == "sglang" and role != "decode":
+            # The compiler writes the prefill chunk; the Sweeper leaves the scheduler's default unwritten.
+            rank.setdefault("sglang", {}).setdefault("chunked_prefill_size", SGLANG_DEFAULT_CHUNKED_PREFILL_SIZE)
         timing_model = rank["timing_model"]
         if timing_model.get("type") != "external":
             # Built-in models carry their whole meaning in the descriptor.

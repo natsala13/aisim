@@ -361,6 +361,10 @@ follows the AgentX client, the AIPerf fork in the
   offset from the turn's start.
 - The joining turn waits for every child with no added gap, and for its own
   recorded delay after the previous main turn.
+- Only a play's root is held to its recorded offset. Every other request is
+  timed by its dependency edges alone, so a replay that runs faster than the
+  recording, or whose idle gaps are capped, does not wait for recorded
+  timestamps.
 - A subagent that no main turn precedes is dropped. A flattened chain that no
   main turn precedes is spawned by the first one.
 - Each stream is its own chat conversation: its first request is one user
@@ -408,11 +412,10 @@ Supported runtimes: offline `engine` stack, vLLM or SGLang, aggregated or P/D
 workers and HBM-only KV cache, including
 [speculative decoding](engine/speculation.md) with explicit acceptance
 assumptions; ngram requires vLLM. vLLM additionally
-supports [G2 host offload](engine/kv-cache.md#agentic-g2) with static workers:
-one aggregated worker, 1P1D, or several aggregated workers with
-`scope: dp_rank_local`; `attention_data: 1` on every role. Speculation with G2
-is limited to canonical MTP on a single aggregated worker with local G2 and
-prefix caching. TensorRT-LLM, G3 offload and online
+supports [G2 host offload](engine/kv-cache.md#agentic-g2) with static workers,
+aggregated or P/D with any positive integer worker count and `attention_data: 1`
+on every role. Speculation with G2 is limited to canonical MTP on a single
+aggregated worker with local G2 and prefix caching. TensorRT-LLM, G3 offload and online
 P/D are rejected. Results are qualified `functional_only`, not hardware
 accuracy. [Start an AgentX simulation](agentic/quickstart.md) walks through a
 complete run.

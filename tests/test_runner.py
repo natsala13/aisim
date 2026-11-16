@@ -513,7 +513,7 @@ def test_public_runner_infers_canonical_depth_without_duplicate_rank_input(backe
     assert inferred.metrics["total_output_tokens"] == 16
     for metric in ("mean_e2e_latency_ms", "mean_ttft_ms", "mean_tpot_ms", "output_throughput_tok_s"):
         assert inferred.metrics[metric] == explicit.metrics[metric]
-    with pytest.raises(RuntimeError, match="aic_nextn conflicts with resolved speculative depth 2"):
+    with pytest.raises(RuntimeError, match="canonical speculative depth conflicts with scheduler aic_nextn"):
         runner.run(replace(spec, backend_deployment=replace(deployment, agg_engine_args={**args, "aic_nextn": 1})))
 
 
@@ -761,18 +761,33 @@ def test_agentic_g2_runner_capability_remains_explicit(nested_rank, scopes, work
 @pytest.mark.parametrize(
     "scopes,field,value",
     [
+        (("dp_rank_local",), "num_workers", 2),
         (("cluster_shared",), "num_workers", 2),
-        (("cluster_shared",), "num_workers", 0),
-        (("dp_rank_local",), "num_workers", True),
         (("dp_rank_local", None), "num_prefill_workers", 2),
-        ((None, "cluster_shared"), "num_decode_workers", 2),
+        ((None, "cluster_shared"), "num_decode_workers", 3),
+    ],
+)
+def test_agentic_g2_accepts_multiple_replicas(nested_rank, scopes, field, value):
+    spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
+    spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: value}))
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize(
+    "scopes,field,value",
+    [
+        (("cluster_shared",), "num_workers", 0),
+        (("dp_rank_local",), "num_workers", -1),
+        (("cluster_shared",), "num_workers", 1.5),
+        (("dp_rank_local",), "num_workers", True),
         (("dp_rank_local", "cluster_shared"), "num_prefill_workers", 0),
     ],
 )
-def test_agentic_g2_rejects_unqualified_worker_counts(nested_rank, scopes, field, value):
+def test_agentic_g2_rejects_invalid_worker_counts(nested_rank, scopes, field, value):
     spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
     spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: value}))
-    with pytest.raises(ValueError, match="one aggregated worker or one prefill and one decode"):
+    with pytest.raises(ValueError, match="at least one worker on every role"):
         EngineReplayRunnerFactory().capabilities().require_compatible(spec)
 
 
@@ -3292,6 +3307,7 @@ def test_direct_replay_capacity_uses_the_resolved_timing_version(monkeypatch, tm
         "estimator": "op_level",
         "timing_source": "aic",
         "data_version": expected,
+        "database_mode": "SILICON",
         "data_identity": None,
         "data_version_unavailable_reason": None,
     }

@@ -183,6 +183,14 @@ def test_disagg_deployment_lowers_only_the_sglang_decode_radix_cache(backend, en
     assert deployment.decode_engine_args["enable_prefix_caching"] is prefix_caching
     assert "sglang" not in deployment.prefill_engine_args
 
+    if backend == "sglang":
+        # A prefill budget off the scheduler's default is its chunk, in whole pages.
+        sample["prefill_max_num_batched_tokens"] = 2049
+        sample["prefill_block_size"] = 16
+        deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
+        assert deployment.prefill_engine_args["sglang"] == {"chunked_prefill_size": 2048}
+        assert deployment.decode_engine_args.get("sglang") == expected
+
 
 def test_disagg_backend_deployment_uses_role_hardware():
     parallel = DisaggParallelConfig(

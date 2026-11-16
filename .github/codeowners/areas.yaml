@@ -83,6 +83,7 @@ areas:
       - tests/test_runner.py
       - tests/test_aiperf_metrics.py
       - tests/fixtures/aiperf_0.13.0_request_metrics.json
+      - tests/test_sglang_pd_replay.py
       - tests/test_traffic.py
       - tests/e2e/
   - label: mocker
@@ -107,7 +108,9 @@ areas:
       - scripts/
       - benchmarks/
       - tests/test_aic_sync.py
+      - tests/test_cloud_agent_install.py
       - tests/test_ci_workflow_contracts.py
+      - tests/test_artifactory_wheel_handoff.py
       - tests/test_ci_qualification.py
       - tests/test_pages_site.py
       - tests/test_release_fpe.py
@@ -154,6 +157,10 @@ shared:
     owners: [replay, mocker, maintainers]
   - glob: .claude/skills/aisim-replay-performance
     owners: [replay, mocker, maintainers]
+  - glob: .agents/skills/aisim-agentx-collect/
+    owners: [replay, forward-pass-engine, infra, maintainers]
+  - glob: .claude/skills/aisim-agentx-collect
+    owners: [replay, forward-pass-engine, infra, maintainers]
   - glob: .agents/skills/aisim-agentx-gap-debug/
     owners: [replay, forward-pass-engine, maintainers]
   - glob: .claude/skills/aisim-agentx-gap-debug
@@ -326,6 +333,8 @@ shared:
     owners: [replay, sweeper, maintainers]
   - glob: tests/fixtures/aiperf_0.13.0_request_metrics.json
     owners: [replay, sweeper, maintainers]
+  - glob: tests/test_sglang_pd_replay.py
+    owners: [replay, maintainers]
   - glob: tests/test_traffic.py
     owners: [replay, maintainers]
   - glob: tests/e2e/
@@ -357,6 +366,8 @@ shared:
   - glob: deny.toml
     owners: [infra, maintainers]
   - glob: pytest.ini
+    owners: [infra, maintainers]
+  - glob: .cursor/
     owners: [infra, maintainers]
   - glob: scripts/
     owners: [infra, maintainers]

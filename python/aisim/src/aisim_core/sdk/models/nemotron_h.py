@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import aisim_core.sdk.operations as ops
 from aisim_core.sdk import common
+from aisim_core.sdk.errors import InvalidEngineConfigurationError
 from aisim_core.sdk.models.base import BaseModel, register_model
 from aisim_core.sdk.models.helpers import mtp_scale_factor
+
+_MAMBA_SSM_CACHE_BYTES = {"float32": 4, "bfloat16": 2, "float16": 2}
 
 
 @register_model("NEMOTRONH")
@@ -80,6 +83,21 @@ class NemotronHModel(BaseModel):
         Args:
             hybrid_config: NemotronHConfig containing hybrid_override_pattern and layer parameters
         """
+        if hybrid_config.mamba_ssm_cache_dtype not in _MAMBA_SSM_CACHE_BYTES:
+            raise ValueError(
+                f"Unsupported mamba_ssm_cache_dtype {hybrid_config.mamba_ssm_cache_dtype!r}; "
+                f"expected one of {sorted(_MAMBA_SSM_CACHE_BYTES)}"
+            )
+        tp_size = self.config.tp_size
+        if hybrid_config.mamba_num_heads % tp_size:
+            raise InvalidEngineConfigurationError(
+                f"NemotronH mamba_num_heads ({hybrid_config.mamba_num_heads}) must be divisible by tp_size ({tp_size})."
+            )
+        if hybrid_config.n_groups >= tp_size and hybrid_config.n_groups % tp_size:
+            raise InvalidEngineConfigurationError(
+                f"NemotronH n_groups ({hybrid_config.n_groups}) "
+                f"must be divisible by tp_size ({tp_size}) when n_groups >= tp_size."
+            )
         self._hybrid_config = hybrid_config
         self._build_context_ops()
         self._build_generation_ops()
@@ -95,10 +113,49 @@ class NemotronHModel(BaseModel):
         }
 
     def get_kvcache_elements_per_token(self) -> int:
-        # Mamba state is fixed per request and must be budgeted separately.
+        # Only attention layers hold token-linear KV; the constant per-request
+        # Mamba state is priced in _mamba_state_bytes_per_request.
         tp = self.config.tp_size
         kv_heads = (self._num_kv_heads + tp - 1) // tp
         return self._count_layer_types()["*"] * 2 * kv_heads * self._head_size
+
+    def _mamba_state_bytes_per_request(self) -> float:
+        """Constant Mamba2 state per request on one GPU: the SSM state in the
+        configured cache dtype plus the BF16 convolution window, per Mamba
+        layer, TP-sharded the way the op graph shards heads and groups."""
+        cfg = self._hybrid_config
+        tp = self.config.tp_size
+        nheads_per_gpu = cfg.mamba_num_heads // tp
+        n_groups_per_gpu = max(cfg.n_groups // tp, 1)
+        ssm_bytes = (
+            nheads_per_gpu * cfg.mamba_head_dim * cfg.ssm_state_size * _MAMBA_SSM_CACHE_BYTES[cfg.mamba_ssm_cache_dtype]
+        )
+        conv_channels = nheads_per_gpu * cfg.mamba_head_dim + 2 * n_groups_per_gpu * cfg.ssm_state_size
+        conv_bytes = conv_channels * (cfg.conv_kernel - 1) * 2
+        return self._count_layer_types()["M"] * (ssm_bytes + conv_bytes)
+
+    def get_kvcache_bytes_per_sequence(self, seq_len: int) -> float:
+        seq_len = max(0, seq_len)
+        token_bytes = seq_len * self.config.kvcache_quant_mode.value.memory * self.get_kvcache_elements_per_token()
+        return token_bytes + self._mamba_state_bytes_per_request()
+
+    def get_kvcache_max_tokens(self, kv_budget_bytes: float) -> int:
+        per_token = self.config.kvcache_quant_mode.value.memory * self.get_kvcache_elements_per_token()
+        budget = kv_budget_bytes - self._mamba_state_bytes_per_request()
+        if budget <= 0 or per_token <= 0:
+            return 0
+        return int(budget // per_token)
+
+    def get_kvcache_batch_capacity(self, kv_budget_bytes: float, max_batch_size: int) -> int:
+        # Reserve the state for every scheduler slot before budgeting the token
+        # pool: SGLang sizes its Mamba state pool by the request slots up front,
+        # and vLLM V1 takes the state from the shared pool as requests run, so the
+        # per-slot reservation is the conservative bound for both.
+        per_token = self.config.kvcache_quant_mode.value.memory * self.get_kvcache_elements_per_token()
+        budget = kv_budget_bytes - max_batch_size * self._mamba_state_bytes_per_request()
+        if budget <= 0 or per_token <= 0:
+            return 0
+        return int(budget // per_token)
 
     def _build_context_ops(self) -> None:
         """Build the context (prefill) operations pipeline based on hybrid pattern."""
@@ -149,17 +206,18 @@ class NemotronHModel(BaseModel):
                         h,
                         gemm_quant_mode,
                     ),
+                    # Mamba2 kernels run on the per-rank shard; the perf table is keyed by the shard geometry.
                     ops.Mamba2Kernel(
                         "context_mamba_conv1d",
                         count,
                         "causal_conv1d_fn",
                         "context",
                         hidden_size=h,
-                        nheads=cfg.mamba_num_heads,
+                        nheads=nheads_per_gpu,
                         head_dim=cfg.mamba_head_dim,
                         d_state=cfg.ssm_state_size,
                         d_conv=cfg.conv_kernel,
-                        n_groups=cfg.n_groups,
+                        n_groups=n_groups_per_gpu,
                         chunk_size=cfg.chunk_size,
                     ),
                     ops.Mamba2Kernel(
@@ -168,11 +226,11 @@ class NemotronHModel(BaseModel):
                         "mamba_chunk_scan_combined",
                         "context",
                         hidden_size=h,
-                        nheads=cfg.mamba_num_heads,
+                        nheads=nheads_per_gpu,
                         head_dim=cfg.mamba_head_dim,
                         d_state=cfg.ssm_state_size,
                         d_conv=cfg.conv_kernel,
-                        n_groups=cfg.n_groups,
+                        n_groups=n_groups_per_gpu,
                         chunk_size=cfg.chunk_size,
                     ),
                     ops.GEMM(
@@ -443,17 +501,18 @@ class NemotronHModel(BaseModel):
                         h,
                         gemm_quant_mode,
                     ),
+                    # Mamba2 kernels run on the per-rank shard; the perf table is keyed by the shard geometry.
                     ops.Mamba2Kernel(
                         "generation_mamba_conv1d",
                         count,
                         "causal_conv1d_update",
                         "generation",
                         hidden_size=h,
-                        nheads=cfg.mamba_num_heads,
+                        nheads=nheads_per_gpu,
                         head_dim=cfg.mamba_head_dim,
                         d_state=cfg.ssm_state_size,
                         d_conv=cfg.conv_kernel,
-                        n_groups=cfg.n_groups,
+                        n_groups=n_groups_per_gpu,
                         chunk_size=cfg.chunk_size,
                     ),
                     ops.Mamba2Kernel(
@@ -462,11 +521,11 @@ class NemotronHModel(BaseModel):
                         "selective_state_update",
                         "generation",
                         hidden_size=h,
-                        nheads=cfg.mamba_num_heads,
+                        nheads=nheads_per_gpu,
                         head_dim=cfg.mamba_head_dim,
                         d_state=cfg.ssm_state_size,
                         d_conv=cfg.conv_kernel,
-                        n_groups=cfg.n_groups,
+                        n_groups=n_groups_per_gpu,
                         chunk_size=cfg.chunk_size,
                     ),
                     ops.GEMM(

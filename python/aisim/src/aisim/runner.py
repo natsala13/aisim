@@ -134,7 +134,13 @@ class EngineReplayRuntime(Protocol):
     """Serialized execution seam used by the engine-only Runner."""
 
     def run_replay_json(self, execution_spec_json: str) -> str:
-        """Run one serialized execution spec and return serialized report JSON."""
+        """Run one serialized execution spec and return serialized report JSON.
+
+        A payload with a replay-valued ``spec`` key or any configured key (such
+        as ``capture_telemetry``) is a configured payload, and its field errors
+        are reported. Any other payload runs as a bare ``ReplaySpec``. See
+        ``docs/replay/api/python.md`` (Lifecycle and errors).
+        """
 
 
 @dataclass(frozen=True)
@@ -930,6 +936,9 @@ def _materialize_engine_execution_spec(
     if max_sim_time_ms is not None:
         max_sim_time_ms = _nonnegative_time(max_sim_time_ms, "max_sim_time_ms")
 
+    placement_config: dict[str, JSONValue] | None = None
+    if deployment_mode == "disagg" and raw_decode.get("load_balance_method") is not None:
+        placement_config = {"load_balance_method": raw_decode["load_balance_method"]}
     execution_spec: dict[str, JSONValue] = {
         "version": 1,
         "topology": topology,
@@ -937,7 +946,7 @@ def _materialize_engine_execution_spec(
         "adapters": {
             "placement": {
                 "provider": "round_robin",
-                "config": None,
+                "config": placement_config,
             },
             "scaling": {
                 "provider": "none",
@@ -1461,6 +1470,12 @@ def _materialize_engine_role(
             )
     role_config.pop("worker_type", None)
     role_config.pop("startup_time", None)
+    load_balance_method = role_config.pop("load_balance_method", None)
+    nested = role_config.get("rank")
+    if isinstance(nested, Mapping) and "load_balance_method" in nested:
+        raise ValueError(f"{role} load_balance_method is a flat engine argument, not a rank field")
+    if load_balance_method not in (None, "round_robin") and role != "decode":
+        raise ValueError(f"{role} load_balance_method={load_balance_method!r} applies only to the decode role")
     model = role_config.pop("aic_model_path", None)
     system = role_config.pop("aic_system", None)
     # Capacity-only input. It has already been consumed by the Python AIC

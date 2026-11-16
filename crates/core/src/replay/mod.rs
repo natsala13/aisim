@@ -120,6 +120,9 @@ pub use capture::{CANONICAL_SELECTOR_SEED, ReplayCaptureOptions, ReplayDetermini
 pub use components::TrafficStats;
 #[doc(hidden)]
 pub use components::{NoReplayMetadata, ReplayAdmissionMetadata, ReplayEngineObservation};
+/// Cross-crate integration seam; see `docs/replay/api/rust.md`.
+#[doc(hidden)]
+pub use core::ReplayWorkloadSource;
 pub use core::round_robin::{AggregatedRoundRobinPlacement, PoolRoundRobinPlacement};
 pub use core::{EngineEventBatch, NoEngineEvents};
 pub use core::{
@@ -159,7 +162,7 @@ pub use protocol::{
 pub use protocol::{AuthoredKvHints, ForwardPassSnapshot};
 #[doc(hidden)]
 pub use replayer::ReplayRuntimeInput;
-pub use replayer::{ReplayComposition, Replayer, RoundRobinComposition};
+pub use replayer::{LoadBalanceMethod, ReplayComposition, Replayer, RoundRobinComposition};
 #[doc(hidden)]
 pub use report::TraceCollector;
 pub use report::{

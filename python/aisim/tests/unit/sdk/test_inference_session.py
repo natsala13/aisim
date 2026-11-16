@@ -256,6 +256,91 @@ def _run(
     )
 
 
+@pytest.mark.parametrize("power_w", [None, float("nan"), 325.25])
+def test_agg_optimization_e2e_power_matches_selected_row(monkeypatch, runtime_config, power_w):
+    from aisim.sdk.backends.factory import get_backend
+
+    backend = get_backend("vllm")
+
+    def candidate(model, database, runtime_config, **kwargs):
+        # Enumeration visits the slower numeric candidate first. Selection
+        # must take power from the faster row, including NaN in mixed tables.
+        row = _static_row(tp=1, bs=runtime_config.batch_size)
+        row.update({"power_w": power_w if runtime_config.batch_size == 2 else 100.0})
+        return _make_summary(row, runtime_config)
+
+    monkeypatch.setattr(backend, "run_agg", candidate)
+    session = InferenceSession(SimpleNamespace(encoder_config=None), MagicMock(), backend)
+    summary = session.find_best_agg_result_under_constraints(runtime_config, max_batch_size=2)
+    assert summary.get_summary_df().iloc[0]["bs"] == 2
+    if pd.isna(power_w):
+        assert summary.get_e2e_power_avg() is None
+    else:
+        assert summary.get_e2e_power_avg() == power_w
+
+
+def test_agg_optimization_empty_results_have_no_power(monkeypatch, runtime_config):
+    from aisim.sdk.backends.factory import get_backend
+
+    backend = get_backend("vllm")
+    session = InferenceSession(SimpleNamespace(encoder_config=None), MagicMock(), backend)
+    summary = session.find_best_agg_result_under_constraints(runtime_config, max_batch_size=0)
+    assert summary.get_summary_df().empty
+    assert summary.get_e2e_power_avg() is None
+
+
+@pytest.mark.parametrize("power_w", [None, float("nan"), 325.25])
+@pytest.mark.parametrize("autoscale", [False, True])
+def test_disagg_optimization_e2e_power_matches_selected_row(
+    monkeypatch, disagg_session, runtime_config, model_config, power_w, autoscale
+):
+    def candidates(*, mode, **kwargs):
+        rows = [
+            _static_row(tp=1, bs=1, mode=mode, osl=runtime_config.osl),
+            _static_row(tp=1, bs=2, mode=mode, osl=runtime_config.osl),
+        ]
+        for row in rows:
+            row.update(power_w=power_w, power_coverage=1.0)
+        return pd.DataFrame(rows)
+
+    monkeypatch.setattr(disagg_session, "get_worker_candidates", candidates)
+    summary = disagg_session.find_best_disagg_result_under_constraints(
+        model_path="test-model",
+        runtime_config=runtime_config,
+        prefill_model_config=model_config,
+        prefill_parallel_config_list=[(1, 1, 1, 1, 1, 1)],
+        prefill_max_num_tokens=4000,
+        prefill_num_worker_list=[1, 2],
+        decode_model_config=model_config,
+        decode_parallel_config_list=[(1, 1, 1, 1, 1, 1)],
+        decode_max_num_tokens=2,
+        decode_num_worker_list=[1, 2],
+        num_gpu_list=None,
+        autoscale=autoscale,
+    )
+    assert not summary.get_summary_df().empty
+    if pd.isna(power_w):
+        assert pd.isna(summary.get_summary_df()["power_w"].iloc[0])
+        assert summary.get_e2e_power_avg() is None
+    else:
+        assert summary.get_summary_df()["power_w"].iloc[0] == power_w
+        assert summary.get_e2e_power_avg() == power_w
+
+
+def test_disagg_optimization_empty_results_have_no_power(monkeypatch, disagg_session, runtime_config, model_config):
+    monkeypatch.setattr(disagg_session, "get_worker_candidates", lambda **kwargs: pd.DataFrame())
+    summary = _run(
+        disagg_session,
+        runtime_config,
+        model_config,
+        prefill_cfgs=[(1, 1, 1, 1, 1, 1)],
+        decode_cfgs=[(1, 1, 1, 1, 1, 1)],
+        require_same_tp=False,
+    )
+    assert summary.get_summary_df().empty
+    assert summary.get_e2e_power_avg() is None
+
+
 def test_legacy_disagg_sweep_uses_nested_qwen35_vision_config(monkeypatch, model_config):
     vision_config = common.VisionEncoderConfig(
         depth=27,

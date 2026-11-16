@@ -592,6 +592,35 @@ metadata does not load the native extension.
 | Positional worker/options and separate estimator constructors | `RustForwardPassPerfModel.best_available(config)` / Rust `ForwardPassPerfModel::best_available(config)` | Pass one complete `ForwardPassPerfModelConfig`; use its Rust constructor or Python SDK config class. |
 | Flat `EngineConfig` plus `ForwardPassPerfOptions` | Canonical `ForwardPassPerfModelConfig` | Convert saved legacy values with the explicit migration helper below. |
 
+### SDK power results and accessors
+
+SDK static, aggregate, and disaggregated schema-6 and schema-7 FPM results now
+publish `power_w: null` (`None` in Python), previously `0.0`. The row and
+`get_e2e_power_avg()` preserve unavailable power as `None`. For static and
+disaggregated summaries, `get_context_power_avg()` and
+`get_generation_power_avg()` also return `None`. Handle unavailable power
+before arithmetic or numeric formatting; do not interpret it as zero watts.
+Latency and available operation energy are unchanged, and true coverage remains
+available through `get_power_data_coverage()`.
+
+For op-level aggregate and disaggregated summaries, `get_e2e_power_avg()` now
+returns the published row's `power_w`, rather than the previously unset default
+`0.0`. For FPM it returns `None` whenever that row withholds watts. Optimization
+summaries use their first ranked row and return `None` for an empty result.
+Schema-8 aggregate FPM watts are coverage-gated, just like static results:
+numeric power requires at least 90% latency-weighted coverage and the other
+[SDK publication conditions](../perf-model/power.md); aggregate watts are not
+unconditionally withheld. DataFrame columns and result keys are unchanged;
+the power values and accessor behavior change as described above.
+
+The synthetic SDK regressions in
+[`TestFPMPowerPublication`](../../python/aisim/tests/unit/sdk/test_fpm_forward.py)
+cover schema-6/schema-7 static, aggregate, and disaggregated nulls, the three
+getters, and op-level row/accessor agreement. The optimization regressions in
+[`test_inference_session.py`](../../python/aisim/tests/unit/sdk/test_inference_session.py)
+cover selected, withheld, NaN, and empty results. These tests establish output
+contracts, not measured power accuracy.
+
 ### Saved performance-model configuration
 
 Saved agg/disagg `exp_config.yaml` files remain loadable: `Task.from_yaml()`

@@ -35,6 +35,47 @@ license is at the pinned repository's `LICENSE`, and the full license is
 included here as `LICENSE`. Modified for AISim's private FIFO transfer lane
 and discrete-event acknowledgements. No serving implementation is vendored.
 
+## SGLang v0.5.22 data-parallel token budgets
+
+Token-budget selection and snapshot refresh in repository-root
+`crates/core/src/replay/core/{mod.rs,round_robin.rs}`,
+`crates/core/src/replay/{disagg.rs,replayer.rs}`,
+`crates/core/src/replay/components/engine.rs`,
+`crates/core/src/engine/scheduler/rank.rs`,
+`crates/core/src/engine/scheduler/sglang/{core.rs,tests.rs}`,
+`tests/test_sglang_pd_replay.py`, and the descriptions in
+`docs/replay/engine/workers.md` and `docs/adapters/native-composition.md`
+are modified behavioral adaptations of SGLang v0.5.22 at commit
+`baa9befa381511cd4d56f83980951e5a45fffc6d`:
+https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
+
+Original paths: `python/sglang/srt/managers/data_parallel_controller.py` and
+`python/sglang/srt/managers/scheduler_components/{load_inquirer.py,pool_stats_observer.py}`.
+Copyright 2023-2024 SGLang Team. Licensed under Apache-2.0; the upstream
+license is at the pinned repository's `LICENSE`, and the full license is
+included here as `LICENSE`. Modified for deterministic virtual time and
+settled-pass snapshots instead of shared-memory reads. No serving code is vendored.
+
+## SGLang v0.5.21 sliding-window prefix reuse
+
+The sliding-window (SWA) prefix marks, page grid, and pool bound in repository-root
+`crates/core/src/engine/cache/radix_cache.rs`, their sizing in
+`crates/core/src/engine/kv_manager/{sglang_backend.rs,sglang_backend/hicache.rs}`,
+the finish boundary in `crates/core/src/engine/scheduler/sglang/{decode.rs,tests.rs}`,
+the lowering in `python/aisim/src/aisim/compiler.py`, the descriptions in
+`docs/replay/engine/kv-cache.md`, `tests/test_sglang_pd_replay.py`, and their
+regression tests are modified
+behavioral adaptations of
+`python/sglang/srt/mem_cache/unified_cache/components/swa.py` in SGLang
+v0.5.21 at commit `e00930c5489053f26d86b179cee0d087f846acbb`:
+https://github.com/sgl-project/sglang/tree/e00930c5489053f26d86b179cee0d087f846acbb
+
+Copyright 2023-2026 SGLang Team. Licensed under Apache-2.0; the upstream
+license is at the pinned repository's `LICENSE`, and the full license is
+included here as `LICENSE`. Modified for AISim's page-hash radix cache,
+least-recently-used page bound, and synthetic replay outputs. No serving
+implementation is vendored.
+
 ## SGLang v0.5.22 cache-salt namespaces
 
 The cache-salt behavior in repository-root
@@ -314,16 +355,32 @@ shipped as ai-dynamo 1.5.0.dev20260917 in
 `lmsysorg/sglang@sha256:b0d8718a4424bb22e448e04407ab3ce5f7399a4c5fc702d6fbe36c3772ec8862`
 (file SHA256 `76cdd291e92c3c41f259279c316bcdedcc6a9aa615ad61e29ca6997105950047`, git blob
 `cbc2a12947ce18304721ac0549274fbeac51ddef`). Its queued-request classification for vLLM
-v0.31.0 (`_compute_queued` over `waiting` and `kv_holding_waiting`, replacing the removed
+v0.33.0 (`_compute_queued` over `waiting` and `kv_holding_waiting`, replacing the removed
 `skipped_waiting`) is ported from the same path at
-https://github.com/ai-dynamo/dynamo/tree/395f02405c1dd1835ab73a39f7a5984ae5fd4552 (file SHA256
-`06fcb26ffcfeb4d58a01704d8d7842d9d838d4a34170a1086f09e5617442da8e`, git blob
-`c19f8174b2e232cf8c0f5a26da83b8085ef71776`). Changes: GLM-5.3-Flash
+https://github.com/ai-dynamo/dynamo/tree/9abd2ef0d908c4bb323e1b8956ea76a5772a1d41 (file SHA256
+`2509d616b888cbbdf87888a7f305feeb8c1c6643c4dd5bc348c66b5fb297aaee`, git blob
+`ff366785a75d0d5aadf8b0cfbc85c4de96a8ea1a`; ai-dynamo 1.7.0.dev20261109 ships the same file). Changes: GLM-5.3-Flash
 default serving state (prefix caching on, Mamba align mode), seeded token inputs, executed
 per-request geometries on the 4-token IndexPool grid with recorded prefill chunk starts,
 5+10 repetitions with native-FPM validation, and compact deferred evidence. Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 Licensed under Apache-2.0; the upstream license is preserved in the adjacent `LICENSE`.
 No upstream root NOTICE exists. vLLM and SGLang implementation files are not vendored.
+
+## Dynamo 1.7 merge checks in the GLM-5.3-Flash producer tests
+
+`dynamo_merge_refusal` in
+`python/aisim/tests/unit/collector/test_fpm_glm53flash_prefix_seed.py` is
+modified code adapted from `components/src/dynamo/vllm/worker_factory.py` in
+https://github.com/ai-dynamo/dynamo/tree/9abd2ef0d908c4bb323e1b8956ea76a5772a1d41
+(file SHA256 `4560426701a52a5adb56a37ef3831d905a2c677eb7d72050f840b53f71401b77`, git blob
+`c2ad87ce4b475b53ff733dd5a1e27d785801a64b`; ai-dynamo 1.7.0.dev20261109 ships the same file).
+It follows the point checks of `_merge_benchmark_rank_results` and
+`_validate_execution_measurement` and keeps their error texts. Changes: it checks the
+saved points of one attention-DP rank of a test fake and returns the refusal text
+instead of raising. Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights
+reserved. Licensed under Apache-2.0; the upstream license is preserved in
+`python/aisim/collector/fpm_forward/runtime/glm53flash/LICENSE`. No upstream root
+NOTICE exists.
 
 ## NVIDIA AIConfigurator speculative decoding
 
@@ -2321,3 +2378,32 @@ padding are not modeled, and `longest_split` counts every scheduled request,
 including prefill requests, which vLLM runs in the context kernel rather
 than the decode kernel. The Apache-2.0 license text is included in this
 repository as `LICENSE`.
+
+## AIConfigurator PR #1606 migration
+
+The following repository-root paths contain modified adaptations of the
+AIConfigurator contribution at immutable commit `a97c69677af23190eada7ee893afa6a04a0ef269`:
+
+- `python/aisim/tests/unit/collector/_real_torch.py` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/a97c69677af23190eada7ee893afa6a04a0ef269/tests/unit/collector/_real_torch.py
+- `python/aisim/tests/unit/collector/test_real_torch.py` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/a97c69677af23190eada7ee893afa6a04a0ef269/tests/unit/collector/test_real_torch.py
+- `python/aisim/tests/unit/collector/test_dsv4_megamoe_workload.py` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/a97c69677af23190eada7ee893afa6a04a0ef269/tests/unit/collector/test_dsv4_megamoe_workload.py
+- `python/aisim/tests/unit/collector/test_helper_moe_distribution.py` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/a97c69677af23190eada7ee893afa6a04a0ef269/tests/unit/collector/test_helper_moe_distribution.py
+- `python/aisim/tests/unit/collector/test_sglang_moe_ep_routing.py` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/a97c69677af23190eada7ee893afa6a04a0ef269/tests/unit/collector/test_sglang_moe_ep_routing.py
+
+- `python/aisim/tests/unit/collector/test_vllm_mla_input_population.py`
+  adapts the shared borrow context in
+  https://github.com/ai-dynamo/aiconfigurator/blob/a97c69677af23190eada7ee893afa6a04a0ef269/tests/unit/collector/_real_torch.py
+
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+The contribution was submitted by xinjun.jiang. Licensed under Apache-2.0;
+the license text is included in the repository and Python distribution.
+Upstream license:
+https://github.com/ai-dynamo/aiconfigurator/blob/a97c69677af23190eada7ee893afa6a04a0ef269/LICENSE
+
+Modified for AISim's current layout and contracts; source links are
+preserved beside the adapted content.

@@ -579,6 +579,17 @@ def estimate_kv_bytes_per_token(
         allow_hf_config_download=True,
     )
     kvcache_quant_mode = _quant_mode_name("kvcache", kvcache_quant_mode)
+    if getattr(estimator, "architecture", None) == "DeepseekV4ForCausalLM":
+        # The dense formula prices every layer's full BF16 KV (88 KiB/token for V4 Flash). V4 stores
+        # FP8 compressed KV (ratio 4 and 128 layers) plus the indexer K; its sliding-window rows are a
+        # fixed per-request state, not token bytes. Replicated on every TP rank.
+        from aisim_core.sdk.memory.deepseek_v4 import deepseek_v4_state_cache
+        from aisim_core.sdk.models import _get_model_info
+
+        if kvcache_quant_mode not in (None, "fp8"):
+            raise ValueError("DeepSeek V4 stores fp8_ds_mla KV; use kvcache_quant_mode fp8")
+        geometry = _get_model_info(model_name)["extra_params"]
+        return int(deepseek_v4_state_cache(geometry, indexer_cache_dtype="auto")["kv_bytes_per_token"])
     if kvcache_quant_mode is not None:
         from aisim_core.sdk.common import KVCacheQuantMode
 
@@ -596,16 +607,18 @@ def estimate_kv_bytes_per_token(
 def resolve_model_context_length(model_name: str) -> int:
     """Resolve ``context_length: max`` from a local, cached, or HF config."""
 
+    from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
     from aisim_core.sdk.memory import NaiveKVCacheEstimator
 
     # Both modules ship in the same distribution; reuse the canonical loader.
     config = NaiveKVCacheEstimator._load_config(model_name, allow_hf_config_download=True)
     if not isinstance(config, dict):
         raise ValueError(f"could not load Hugging Face config for {model_name!r}")
-    text_config = config.get("text_config")
-    mappings = [config]
-    if isinstance(text_config, dict):
-        mappings.insert(0, text_config)
+    key = decoder_config_key(config)
+    decoder = config.get(key)
+    if key is not None and (problem := decoder_config_problem(key, decoder)) is not None:
+        raise ValueError(f"Hugging Face config for {model_name!r}: {problem}")
+    mappings = [decoder, config] if decoder is not None else [config]
     for mapping in mappings:
         for name in (
             "max_position_embeddings",

@@ -136,6 +136,205 @@ def test_weka_g2_restore_has_causal_bandwidth_and_capacity_controls(name) -> Non
     assert fast["committed_prefill_tokens"] < hbm["committed_prefill_tokens"]
 
 
+@pytest.mark.parametrize("name", ["agentx-g2-local.yaml", "agentx-g2-shared-pd.yaml"])
+def test_weka_g2_runs_on_multiple_replicas(name) -> None:
+    config = _config(name)
+    single = _run(config)
+    for worker in config["engine"]["workers"].values():
+        worker["parallelism"] = {**worker["parallelism"], "replicas": 2}
+    report = _run(config)
+    assert report["completed_requests"] == single["completed_requests"]
+    pools = ("prefill", "decode") if config["engine"]["mode"] == "disaggregated" else ("agg",)
+    for pool in pools:
+        assert {
+            route["logical_worker_id"]
+            for row in report["per_request"]
+            for route in row["routing_history"]
+            if route["pool"] == pool
+        } == {0, 1}
+    # One cluster-shared pool, counted once whatever the replica count.
+    assert report.get("g2_domains", []) == single.get("g2_domains", [])
+
+
+@pytest.mark.parametrize("name", ["agentx-g2-local.yaml", "agentx-g2-shared-pd.yaml"])
+def test_multi_replica_g2_restores_evicted_prefixes(name, tmp_path) -> None:
+    config = _multi_replica_pressure_config(name, tmp_path)
+    report = _run(config)
+    restored = next(row for row in report["per_request"] if row["request_id"].endswith(":outer:4"))
+    assert report["completed_requests"] == 5
+    assert restored["first_admission_g1_reused_input_tokens"] == 0
+    assert restored["first_admission_host_reused_input_tokens"] == 8
+
+    for worker in config["engine"]["workers"].values():
+        worker["kv_cache"].pop("host_offload", None)
+    hbm = _run(config)
+    assert all("first_admission_host_reused_input_tokens" not in row for row in hbm["per_request"])
+    hbm_restored = next(row for row in hbm["per_request"] if row["request_id"].endswith(":outer:4"))
+    assert hbm_restored["reused_input_tokens"] == 0
+    assert report["committed_prefill_tokens"] < hbm["committed_prefill_tokens"]
+
+
+def _multi_replica_pressure_config(name: str, tmp_path: Path) -> dict:
+    config = _config(name)
+    trace = json.loads(Path(config["traffic"]["source"]["paths"][0]).read_text())
+    # Round robin sends 0, 2, 4 to worker 0. Request 2 evicts request 0's
+    # entire GPU prefix, so request 4 must restore it from G2 in either scope.
+    template = trace["requests"][0]
+    trace["requests"] = [
+        {**template, "t": index * 0.1, "hash_ids": hashes}
+        for index, hashes in enumerate(([1, 2, 3], [11, 12, 13], [21, 22, 23], [31, 32, 33], [1, 2, 3]))
+    ]
+    path = tmp_path / "multi-replica-pressure.jsonl"
+    path.write_text(json.dumps(trace) + "\n")
+    config["traffic"]["source"]["paths"] = [str(path)]
+    for worker in config["engine"]["workers"].values():
+        worker["parallelism"] = {**worker["parallelism"], "replicas": 2}
+        # Retain every source prefix across several plays; a cold next play
+        # must follow from identity isolation, not host-capacity eviction.
+        worker["kv_cache"]["host_offload"]["num_host_blocks"] = 128
+    return config
+
+
+@pytest.mark.parametrize("name", ["agentx-g2-local.yaml", "agentx-g2-shared-pd.yaml"])
+def test_multi_replica_g2_isolates_recycled_profile_plays(name, tmp_path) -> None:
+    config = _multi_replica_pressure_config(name, tmp_path)
+    load = config["traffic"]["load"]
+    load["agentic_snapshot"] = {"seed": 42}
+    sampled = _run(config)["agentic_snapshots"][0]
+    # Start the first play at turn zero so it fills G2 with every source prefix
+    # before any recycled play can start at a sampled cut.
+    load["agentic_snapshot"].update(
+        initial_selections=[{"source_play_id": sampled["source_play_id"], "t_star_ms": 0}],
+        corpus_cursor=1,
+    )
+    load["agentic_profile"] = {"duration_seconds": 2, "response_grace_seconds": 1}
+    report = _run(config)
+    snapshots = report["agentic_snapshots"]
+    assert report["agentic_profile"]["plays_started"] >= 2
+    assert len({snapshot["cache_id"] for snapshot in snapshots}) == len(snapshots)
+    plays = {}
+    for row in report["per_request"]:
+        plays.setdefault(row["play_id"], []).append(row)
+    assert len(plays) >= 2
+    first_play = min(plays.values(), key=lambda rows: min(row["first_admit_ms"] for row in rows))
+    assert any(row["first_admission_host_reused_input_tokens"] == 8 for row in first_play)
+    for rows in plays.values():
+        first = min(rows, key=lambda row: row["first_admit_ms"])
+        assert first["first_admission_g1_reused_input_tokens"] == 0
+        assert first["first_admission_host_reused_input_tokens"] == 0
+
+
+def test_weka_shared_g2_contract_across_replicas() -> None:
+    config = _config("agentx-g2-shared-pd.yaml")
+    for worker in config["engine"]["workers"].values():
+        worker["parallelism"] = {**worker["parallelism"], "replicas": 2}
+    shared = _run(config)
+    # Four participants join one deployment-owned pool, counted once.
+    assert [domain["capacity_blocks"] for domain in shared["g2_domains"]] == [8]
+    assert shared["completed_requests"] == _run(_config("agentx-g2-shared-pd.yaml"))["completed_requests"]
+
+    disabled, private = copy.deepcopy(config), copy.deepcopy(config)
+    for worker in disabled["engine"]["workers"].values():
+        worker["kv_cache"]["host_offload"] = {**worker["kv_cache"]["host_offload"], "scope": "dp_rank_local"}
+    for worker in private["engine"]["workers"].values():
+        offload = dict(worker["kv_cache"]["host_offload"], scope="dp_rank_local")
+        for field in ("shared_d2h_bandwidth_gbps", "shared_h2d_bandwidth_gbps"):
+            offload.pop(field, None)
+        worker["kv_cache"]["host_offload"] = offload
+    disabled_report, private_report = _run(disabled), _run(private)
+    # Disabling sharing reproduces private G2 even with shared-only fields left set.
+    assert "g2_domains" not in disabled_report or not disabled_report["g2_domains"]
+    assert disabled_report["per_request"] == private_report["per_request"]
+    assert disabled_report["committed_prefill_tokens"] == private_report["committed_prefill_tokens"]
+
+
+def test_shared_g2_capacity_and_cross_role_restores(tmp_path) -> None:
+    config = _config("agentx-g2-shared-pd.yaml")
+    a, f, b, c, d, e = ([base, base + 1, base + 2] for base in (1, 11, 21, 31, 41, 51))
+    # Independent AgentX requests let prefill run ahead of slower decode.
+    # Both prefill replicas store six two-block prefixes in one eight-block
+    # G2, evicting A/F. Their queued returns must miss the host cache.
+    # Decode later republishes B/C after prefill pressure evicts them, so C
+    # can restore on P0 from D1, and B on P1 from D0. Neither reader has the
+    # prefix in G1. Disabling decode offload must remove both host hits.
+    waves = [(0, a), (1, f), (10, b), (11, c), (20, d), (21, e), (110, a), (111, f), (500, c), (501, b)]
+    header = {
+        "schema": "dynamo.agentic_mooncake",
+        "version": 2,
+        "block_size": 4,
+        "hash_id_scope": "local",
+        "source": {"format": "synthetic-test", "digest": "cross-role-pressure"},
+    }
+    requests = [
+        {
+            "request_id": str(index),
+            "play_id": "pressure",
+            "session_id": str(index),
+            "model": "synthetic-model",
+            "input_length": 9,
+            "output_length": 2,
+            "hash_ids": hashes,
+            "not_before_ms": at_ms,
+            "dependencies": [],
+        }
+        for index, (at_ms, hashes) in enumerate(waves)
+    ]
+    path = tmp_path / "cross-role-pressure.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in [header, *requests]) + "\n")
+    config["traffic"]["source"].update(format="agentic_mooncake", paths=[str(path)])
+    config["traffic"]["source"].pop("nested_timestamp_basis")
+    workers = config["engine"]["workers"]
+    # Detach the example's YAML alias before setting role-specific controls.
+    workers["decode"] = copy.deepcopy(workers["decode"])
+    for role, worker in workers.items():
+        worker["parallelism"]["replicas"] = 2
+        worker["kv_cache"]["capacity"]["blocks"] = 7 if role == "prefill" else 3
+        worker["timing"]["decode_ms"] = 100 if role == "decode" else 1
+
+    def run(candidate):
+        report = _run(candidate)
+        assert report["completed_requests"] == len(waves)
+        return report, {int(row["request_id"]): row for row in report["per_request"]}
+
+    shared, rows = run(config)
+    assert [domain["capacity_blocks"] for domain in shared["g2_domains"]] == [8]
+    for index, replica in ((2, 0), (3, 1), (8, 0), (9, 1)):
+        assert [(route["pool"], route["logical_worker_id"]) for route in rows[index]["routing_history"]] == [
+            ("prefill", replica),
+            ("decode", replica),
+        ]
+    for index in (6, 7):
+        assert rows[index]["first_admission_g1_reused_input_tokens"] == 4
+        assert rows[index]["first_admission_host_reused_input_tokens"] == 0
+    for index in (8, 9):
+        assert rows[index]["first_admission_g1_reused_input_tokens"] == 0
+        assert rows[index]["first_admission_host_reused_input_tokens"] == 8
+
+    no_decode = copy.deepcopy(config)
+    no_decode["engine"]["workers"]["decode"]["kv_cache"].pop("host_offload")
+    _, no_decode_rows = run(no_decode)
+    for index in (8, 9):
+        assert no_decode_rows[index]["first_admission_g1_reused_input_tokens"] == 0
+        assert no_decode_rows[index]["first_admission_host_reused_input_tokens"] == 0
+
+    larger, private = copy.deepcopy(config), copy.deepcopy(config)
+    for worker in larger["engine"]["workers"].values():
+        worker["kv_cache"]["host_offload"]["num_host_blocks"] = 16
+    for worker in private["engine"]["workers"].values():
+        worker["kv_cache"]["host_offload"]["scope"] = "dp_rank_local"
+    _, larger_rows = run(larger)
+    _, private_rows = run(private)
+    for control_rows in (larger_rows, private_rows):
+        # Extra capacity, including accidentally private eight-block pools,
+        # retains A/F: this must differ from the shared pool's earlier misses.
+        for index in (6, 7):
+            assert control_rows[index]["first_admission_g1_reused_input_tokens"] == 4
+            assert control_rows[index]["first_admission_host_reused_input_tokens"] == 4
+    for index in (8, 9):
+        assert private_rows[index]["first_admission_g1_reused_input_tokens"] == 0
+        assert private_rows[index]["first_admission_host_reused_input_tokens"] == 0
+
+
 @pytest.mark.parametrize("field,value", [("num_host_blocks", 16), ("shared_h2d_bandwidth_gbps", 2)])
 def test_weka_g2_rejects_inconsistent_shared_pool(field, value) -> None:
     config = _config("agentx-g2-shared-pd.yaml")
@@ -157,7 +356,6 @@ def test_weka_g2_rejects_incompatible_shared_layout() -> None:
 @pytest.mark.parametrize(
     "fault,message",
     [
-        ("workers", "agentic host offload requires one aggregated worker or one prefill and one decode worker"),
         ("dp", "agentic host offload requires attention DP=1 on every role"),
         ("backend", "agentic host offload requires backend=vllm on every role"),
         ("aic_nextn", "requires canonical mtp speculation"),
@@ -184,15 +382,7 @@ def test_agentic_invalid_configuration_matrix_rejects_python_and_native(role, fa
     args = getattr(spec.backend_deployment, args_field)
     engine = payload["spec"]["engine"] if aggregated else payload["spec"]["engine"][role]
     rank = engine["rank"]
-    if fault == "workers":
-        workers_field = "num_workers" if aggregated else f"num_{role}_workers"
-        spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{workers_field: 2}))
-        payload["spec"]["topology"]["workers" if aggregated else role]["initial_workers"] = 2
-        if aggregated:
-            # Several aggregated workers need a private pool each.
-            for host in (args["native_host_offload"], rank["native_host_offload"]):
-                host.update(scope="cluster_shared", kv_layout_id="agentx-test")
-    elif fault == "dp":
+    if fault == "dp":
         args["aic_attention_dp_size"] = 2
         engine["dp_size"] = 2
         if not aggregated:
@@ -343,7 +533,8 @@ def test_agentic_g3_rejection_matches_without_requiring_g2(backend, with_g2) -> 
 
 
 @pytest.mark.usefixtures("raw_data_coordinates")
-def test_agentic_canonical_mtp_executes_with_local_g2() -> None:
+@pytest.mark.parametrize("replicas", [1, 2])
+def test_agentic_canonical_mtp_with_local_g2_requires_one_worker(replicas) -> None:
     config = _config("agentx-g2-local.yaml")
     engine = config["engine"]
     engine.update(
@@ -359,6 +550,15 @@ def test_agentic_canonical_mtp_executes_with_local_g2() -> None:
     )
     engine["workers"]["aggregated"]["timing"] = {"type": "default"}
     engine["workers"]["aggregated"]["kv_cache"]["capacity"]["blocks"] = 4
+    if replicas == 2:
+        engine["workers"]["aggregated"]["parallelism"]["replicas"] = replicas
+        spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
+        payload = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)
+        with pytest.raises(ValueError, match="agentic G2 replay requires speculative decoding disabled"):
+            EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+        with pytest.raises(RuntimeError, match="agentic host offload requires speculative decoding disabled"):
+            _runtime.run_replay_json(json.dumps(payload))
+        return
     report = _run(config)
     assert report["completed_requests"] == 4
     assert report["total_output_tokens"] == 4

@@ -40,7 +40,7 @@ use crate::common::error::AicError;
 use crate::perfmodel::EngineConfig;
 use crate::perfmodel::engine::runtime::{
     DEFAULT_STATIC_STRIDE, Engine, PerOpSolValue, PerOpValue, PerOpValueWithMetadata,
-    RuntimeConfig, StaticMode, StaticResult,
+    RuntimeConfig, StaticMode, StaticPerOpValuesWithCoverage, StaticResult,
 };
 use crate::{BackendKind, DataType, DatabaseMode, ENGINE_CONFIG_SCHEMA_VERSION};
 
@@ -677,6 +677,53 @@ impl AicEngine {
         py.allow_threads(|| {
             self.inner
                 .run_static_per_op_with_metadata(&rt, mode, stride)
+        })
+        .map_err(aic_to_py)
+    }
+
+    /// Internal `_run_static_per_op_with_metadata` from the same walk, plus
+    /// each phase's power-covered latency: returns ``(context, generation,
+    /// context_covered_ms, generation_covered_ms)``. A query result counts as
+    /// covered when its own energy is positive, decided before the name fold.
+    #[pyo3(signature = (
+        batch_size,
+        beam_width,
+        isl,
+        osl,
+        prefix,
+        seq_imbalance_correction_scale,
+        gen_seq_imbalance_correction_scale,
+        mode="static",
+        stride=DEFAULT_STATIC_STRIDE,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn _run_static_per_op_with_coverage(
+        &self,
+        py: Python<'_>,
+        batch_size: u32,
+        beam_width: u32,
+        isl: u32,
+        osl: u32,
+        prefix: u32,
+        seq_imbalance_correction_scale: f64,
+        gen_seq_imbalance_correction_scale: f64,
+        mode: &str,
+        stride: u32,
+    ) -> PyResult<StaticPerOpValuesWithCoverage> {
+        let rt = RuntimeConfig {
+            batch_size,
+            beam_width,
+            isl,
+            osl,
+            prefix,
+            seq_imbalance_correction_scale,
+            gen_seq_imbalance_correction_scale,
+        };
+        let mode = parse_mode(mode)?;
+        self.inner.reset_provenance();
+        py.allow_threads(|| {
+            self.inner
+                .run_static_per_op_with_coverage(&rt, mode, stride)
         })
         .map_err(aic_to_py)
     }
@@ -1789,6 +1836,17 @@ pub(crate) fn resolve_speculation_identity(
 pub(crate) fn speculation_replay_depth(
     config: &crate::ForwardPassSpeculationConfig,
 ) -> Result<u32, AicError> {
+    // The `python` feature also serves extension hosts, which initialize their
+    // own interpreter. Calling with_gil before that would panic. Embedders opt
+    // into PyO3's automatic initialization with the separate embed-python feature.
+    #[cfg(not(feature = "embed-python"))]
+    if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
+        return Err(AicError::InvalidEngineConfig(
+            "generic speculative replay requires an initialized Python interpreter; \
+             initialize Python or enable the embed-python feature"
+                .into(),
+        ));
+    }
     Python::with_gil(|py| -> PyResult<_> {
         let encoded = serde_json::to_string(config)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -3249,6 +3307,10 @@ mod tests {
             };
             check(
                 AicError::PerfDatabase("missing table".to_string()),
+                "PerfDataNotAvailableError",
+            );
+            check(
+                AicError::LinearAttentionDataMissing("no Mamba2 rows".to_string()),
                 "PerfDataNotAvailableError",
             );
             check(

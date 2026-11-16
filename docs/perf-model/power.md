@@ -8,9 +8,32 @@ SPDX-License-Identifier: Apache-2.0
 Op-level FPE returns operation energy. Native Replay accumulates that evidence
 and computes the coverage-gated power summary. Unified prediction and
 recommendation preserve and display `power_w` and `power_coverage`; `predict
---detail energy` exposes available breakdown evidence. Whole-forward FPM,
-fixed, and polynomial timing remain latency-only. EPD's combined report keeps
-unified power unavailable even when its encoder has separate analytical power.
+--detail energy` exposes available breakdown evidence. In native Replay and
+unified prediction, whole-forward FPM, fixed, and polynomial timing remain
+latency-only. EPD's combined report keeps unified power unavailable even when
+its encoder has separate analytical power.
+
+Python static FPM summaries have a separate operation-energy path: with SOL
+interpolation and powered schema-8 rows, `get_context_energy_wms_dict()` and
+`get_generation_energy_wms_dict()` return nonzero FPM energy. Direct
+interpolation stays latency-only. Mixed steps report zero FPM prefill and
+marginal-decode energy (D10, AISIM-2001), while retaining draft-operation energy.
+SDK and legacy `cli_estimate()` static, aggregated, and disaggregated results
+apply the 90% coverage gate to FPM watts: they publish numeric `power_w` for
+powered schema-8 pairs at or above the gate, and null power with numeric
+coverage below it. Aggregated coverage counts mixed-step latency as uncovered,
+because mixed-step FPM energy is suppressed while pure-decode energy is
+retained; the published `power_w` divides total energy by total active latency.
+Non-schema-8 FPM runs (schema 6 and 7) have no row-power evidence and publish
+null `power_w` (`None` in Python), rather than the previous `0.0` sentinel.
+A disaggregated result withholds power when either worker withholds it. FPM
+watts are also withheld for draft speculation schemes, models with encoder
+operations, and language-only EPD workers. Raw `InferenceSession` summaries
+provide coverage through `get_power_data_coverage()`; `Task.run_single_agg()`
+and `Task.run_single_disagg()` include `power_coverage` in their rows. The
+operation energy stays available below the gate, and static operation energy
+does not enable replay or unified `power_w` publication.
+See [schema-8 behavior](methods/whole-forward.md) for the interpolation contract.
 
 The current producers and consumers are
 [Replay reports](../../crates/core/src/replay/report.rs),
@@ -95,10 +118,12 @@ and sets `power_w` to `null`, allowing a consumer to distinguish insufficient
 data from an unsupported energy path. A provider with an energy channel but
 no covered operations therefore reports `power_coverage: 0` and `power_w: null`.
 
-Fixed, polynomial, and forward-pass-metrics (FPM) timing providers do not
-synthesize energy. A replay using any of those providers, or mixing an
-energy-aware role with an energy-unaware role, returns `power_w: null` and
-`power_coverage: null`. The null values never mean zero watts or zero coverage.
+Native Replay's fixed, polynomial, and forward-pass-metrics (FPM) timing
+providers do not supply an energy channel. A replay using any of those
+providers, or mixing an energy-aware role with an energy-unaware role, returns
+`power_w: null` and `power_coverage: null`, including with a fully powered
+schema-8 FPM pair. Unified prediction preserves these nulls. The null values
+never mean zero watts or zero coverage.
 
 ## Aggregate and disaggregated deployments
 
