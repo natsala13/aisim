@@ -395,7 +395,7 @@ fn check_identity(
             .resolve()?
         }
     };
-    let (expected, base) = (mtp_as_nextn(expected)?, mtp_as_nextn(base)?);
+    let (expected, base) = (mtp_as_nextn(expected), mtp_as_nextn(base));
     if expected != base {
         return Err(identity_mismatch(&expected, &base));
     }
@@ -413,20 +413,21 @@ fn check_identity(
 
 /// A regression fitted at `nextn` N also restores for an MTP scheme of depth
 /// N, and one fitted with the scheme for `nextn` N, so identities compare with
-/// the scheme as its depth.
-fn mtp_as_nextn(
-    mut config: ForwardPassPerfModelConfig,
-) -> Result<ForwardPassPerfModelConfig, AicError> {
+/// the scheme as its depth. Replay's draft-width limit applies when replay
+/// times the role, not here.
+fn mtp_as_nextn(mut config: ForwardPassPerfModelConfig) -> ForwardPassPerfModelConfig {
     if config.estimation_mode == EstimationMode::FpmRegression
-        && config
+        && let Some(depth) = config
             .speculation
             .as_ref()
-            .is_some_and(|speculation| speculation.kind == "mtp")
+            .filter(|speculation| speculation.kind == "mtp")
+            .and_then(|speculation| speculation.params.get("depth")?.as_u64())
+            .and_then(|depth| u32::try_from(depth).ok())
     {
-        config.nextn = config.regression_depth()?;
+        config.nextn = depth;
         config.speculation = None;
     }
-    Ok(config)
+    config
 }
 
 /// First differing JSON path, for actionable identity-mismatch errors.

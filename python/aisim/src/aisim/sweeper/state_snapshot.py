@@ -113,6 +113,24 @@ class SnapshotRole:
         return self.summary["identity"]
 
     @property
+    def mtp_scheme(self) -> bool:
+        """Whether a vLLM regression was fitted with an MTP scheme, which it prices as the ``nextn`` of its depth."""
+
+        return (
+            (self.identity.get("speculation") or {}).get("kind") == "mtp"
+            and self.identity["backend"] == "vllm"
+            and self.summary["selected_estimation_mode"] == "fpm_regression"
+        )
+
+    @property
+    def nextn(self) -> int:
+        """The draft depth replay pins: ``nextn``, or the depth of the MTP scheme a vLLM regression was fitted with."""
+
+        if self.mtp_scheme:
+            return int(self.identity["speculation"]["params"]["depth"])
+        return int(self.identity.get("nextn") or 0)
+
+    @property
     def fitted(self) -> bool:
         """Whether a regression or learned model, which reads no performance data, is saved."""
 
@@ -306,7 +324,7 @@ def _validate_replayable(snapshot: SnapshotRole) -> None:
             )
     if identity.get("fpm_profile") is not None:
         raise ValueError(f"{snapshot.describe()} uses an FPM profile, which snapshot roles do not support")
-    if identity.get("speculation") is not None:
+    if identity.get("speculation") is not None and not snapshot.mtp_scheme:
         raise ValueError(
             f"{snapshot.describe()} records speculation, which snapshot roles do not support (MTP depth, nextn, "
             "is supported)"
@@ -329,10 +347,9 @@ def _validate_fitted(snapshot: SnapshotRole) -> None:
             f"replay prices every {_WORKER_TYPES[role]} iteration with it, so tune it with observed forward passes "
             "of that work before saving it"
         )
-    if int(identity.get("nextn") or 0) > 0 and (identity["backend"] != "vllm" or mode != "fpm_regression"):
+    if snapshot.nextn > 0 and (identity["backend"] != "vllm" or mode != "fpm_regression"):
         raise ValueError(
-            f"{snapshot.describe()} records nextn={identity['nextn']}; only a vLLM fpm_regression model prices MTP "
-            "rounds"
+            f"{snapshot.describe()} records nextn={snapshot.nextn}; only a vLLM fpm_regression model prices MTP rounds"
         )
     if identity.get("backend_version") is None:
         raise ValueError(
@@ -696,7 +713,7 @@ def _pin_engine_identity(value: dict[str, Any], snapshots: list[SnapshotRole]) -
         if saved is not None:
             value[name] = saved
 
-    nextn, owner = _agreed(snapshots, lambda snapshot: int(snapshot.identity.get("nextn") or 0))
+    nextn, owner = _agreed(snapshots, lambda snapshot: snapshot.nextn)
     current = value.get("aic_nextn")
     if (current or 0) != nextn and current is not None:
         raise _conflict(owner, "engine.nextn", current, nextn)

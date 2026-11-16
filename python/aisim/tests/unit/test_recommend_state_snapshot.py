@@ -597,6 +597,7 @@ def planner_snapshots(tmp_path_factory) -> dict[str, Path]:
         "nextn": save("nextn", _planner("decode", kinds=("decode",), nextn=1)),
         "sglang-nextn": save("sglang-nextn", _planner("decode", kinds=("decode",), backend="sglang", nextn=1)),
         "nextn-agg": save("nextn-agg", _planner("aggregated", nextn=1)),
+        "mtp-agg": save("mtp-agg", _planner("aggregated", speculation={"kind": "mtp", "params": {"depth": 1}})),
         "no-kv": save(
             "no-kv", _planner("decode", kinds=("decode",), deployment_limits={**_LIMITS, "max_kv_tokens": "unknown"})
         ),
@@ -917,9 +918,10 @@ def test_an_sglang_aggregated_planner_snapshot_needs_no_locally_mixed_store(plan
         _space(_planner_request(planner_snapshots["vllm-pure"], mode="aggregated"))
 
 
-def test_a_vllm_planner_snapshot_fitted_with_mtp_is_recommended_and_replayed_at_its_nextn(planner_snapshots):
-    # The snapshot pins nextn 1; the engine supplies the accepted draft tokens.
-    raw = _planner_request(planner_snapshots["nextn-agg"], mode="aggregated")
+@pytest.mark.parametrize("snapshot", ["nextn-agg", "mtp-agg"])
+def test_a_vllm_planner_snapshot_fitted_with_mtp_is_recommended_and_replayed_at_its_nextn(planner_snapshots, snapshot):
+    # The snapshot pins depth 1, fitted as nextn or as an MTP scheme; the engine supplies the accepted draft tokens.
+    raw = _planner_request(planner_snapshots[snapshot], mode="aggregated")
     raw["engine"].update(nextn=1, nextn_accepted=0.5)
     result = _planner_run(raw)
     assert result.counts.feasible == 1, [record.reason for record in result.candidates]
@@ -935,6 +937,18 @@ def test_a_vllm_planner_snapshot_fitted_with_mtp_is_recommended_and_replayed_at_
         "expected_accepted_tokens": engine.pop("nextn_accepted"),
     }
     assert _replay(prediction).metrics["mean_tpot_ms"] == candidate.metrics["mean_tpot_ms"]
+
+
+def test_a_regression_fitted_with_more_mtp_drafts_than_replay_runs_restores(tmp_path):
+    # Replay runs 1-5 draft tokens; a saved cost model's identity is not bound by that.
+    model = _planner("decode", kinds=("decode",), speculation={"kind": "mtp", "params": {"depth": 6}})
+    model.save_state_snapshot(tmp_path / "snapshot")
+    restored = RustForwardPassPerfModel.best_available(state_snapshot=tmp_path / "snapshot")
+    try:
+        assert restored.diagnostics()["provenance"]["config"]["speculation"]["params"] == {"depth": 6}
+    finally:
+        restored.close()
+        model.close()
 
 
 def test_an_aggregated_planner_snapshot_with_attention_dp_needs_its_cross_rank_store(planner_snapshots):
