@@ -1,7 +1,7 @@
 # Op database cutover parity: pinned Hugging Face revision versus packaged tables
 
 Post-flip go/no-go evidence for defaulting op-latency data to `ai-dynamo/aisim-data` and dropping the packaged
-tables. `parity-real.json` is the output of `python/aisim/tools/perf_database/op_database_parity.py run` run on the
+tables. `parity-real.json` is the output of a one-off parity harness (not checked in, since it is a single-use script) run on the
 commit before the packaged tables were deleted: the packaged `systems/data` of this branch's base against the real
 downloaded revision `07d52645fb2b021337dc9ce79fce8b5a526bfc51` (catalog SHA-256 `c0a0a65b...`, not a locally built
 tree), loaded with `aisim_core.data.op_tree.load_op_latency_tree`. Local paths are replaced by `<scratch>`.
