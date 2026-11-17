@@ -4012,7 +4012,7 @@ impl VllmCore {
             } else if burst.remaining == 0 {
                 0
             } else {
-                sampler.sample_accepted_tokens_up_to(burst.limit)
+                sampler.sample_campaign_request(burst.uuid, burst.limit)
             };
             if accepted > 0 && burst.records_acceptance {
                 decode_acceptance.accepted_tokens += accepted;

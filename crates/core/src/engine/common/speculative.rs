@@ -49,14 +49,56 @@ pub fn normalize_conditional_accept_rates(
 pub(crate) struct SpeculativeDecodeSampler {
     conditional_accept_rates: Vec<f64>,
     rng: SmallRng,
+    campaign_profiles: Option<Vec<Vec<f64>>>,
+    campaign_assignments: std::collections::HashMap<uuid::Uuid, usize>,
+    campaign_profile_rng: SmallRng,
 }
 
 impl SpeculativeDecodeSampler {
     pub(crate) fn new(conditional_accept_rates: Vec<f64>, seed: u64) -> Self {
+        let campaign_profiles: Option<Vec<Vec<f64>>> =
+            std::env::var("AISIM_CAMPAIGN_ACCEPTANCE_PROFILES")
+                .ok()
+                .map(|path| {
+                    let profiles: Vec<Vec<f64>> = serde_json::from_str(
+                        &std::fs::read_to_string(path).expect("campaign acceptance profile file"),
+                    )
+                    .expect("campaign acceptance profiles must be JSON arrays");
+                    assert!(!profiles.is_empty());
+                    assert!(profiles.iter().all(|rates| {
+                        rates.len() == conditional_accept_rates.len()
+                            && rates
+                                .iter()
+                                .all(|p| p.is_finite() && (0.0..=1.0).contains(p))
+                    }));
+                    profiles
+                });
         Self {
             conditional_accept_rates,
             rng: SmallRng::seed_from_u64(seed),
+            campaign_profiles,
+            campaign_assignments: std::collections::HashMap::new(),
+            campaign_profile_rng: SmallRng::seed_from_u64(seed ^ 0x9e3779b97f4a7c15),
         }
+    }
+
+    /// Private diagnostic: a profile persists for the lifetime of a request.
+    pub(crate) fn sample_campaign_request(&mut self, id: uuid::Uuid, max_tokens: usize) -> usize {
+        let Some(profiles) = self.campaign_profiles.as_ref() else {
+            return self.sample_accepted_tokens_up_to(max_tokens);
+        };
+        let index = *self
+            .campaign_assignments
+            .entry(id)
+            .or_insert_with(|| self.campaign_profile_rng.random_range(0..profiles.len()));
+        let mut output = 1;
+        for rate in profiles[index].iter().take(max_tokens.saturating_sub(1)) {
+            if !self.rng.random_bool(*rate) {
+                break;
+            }
+            output += 1;
+        }
+        output
     }
 
     /// Sample verification acceptance including the base token. Callers clamp
@@ -87,6 +129,80 @@ impl SpeculativeDecodeSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile_sampler(profiles: Option<Vec<Vec<f64>>>, seed: u64) -> SpeculativeDecodeSampler {
+        SpeculativeDecodeSampler {
+            conditional_accept_rates: vec![0.8, 0.6, 0.4],
+            rng: SmallRng::seed_from_u64(seed),
+            campaign_profiles: profiles,
+            campaign_assignments: std::collections::HashMap::new(),
+            campaign_profile_rng: SmallRng::seed_from_u64(seed ^ 0x9e3779b97f4a7c15),
+        }
+    }
+
+    #[test]
+    fn disabled_profiles_preserve_the_existing_stream() {
+        let mut current = profile_sampler(None, 42);
+        let mut original = profile_sampler(None, 42);
+        for i in 1..=200 {
+            let limit = 1 + i as usize % 4;
+            assert_eq!(
+                current.sample_campaign_request(uuid::Uuid::from_u128(i), limit),
+                original.sample_accepted_tokens_up_to(limit)
+            );
+        }
+        assert!(current.campaign_assignments.is_empty());
+    }
+
+    #[test]
+    fn identical_profiles_preserve_the_existing_stream() {
+        let mut profiles = profile_sampler(Some(vec![vec![0.8, 0.6, 0.4]; 5]), 42);
+        let mut original = profile_sampler(None, 42);
+        for i in 1..=200 {
+            assert_eq!(
+                profiles.sample_campaign_request(uuid::Uuid::from_u128(i % 17), 4),
+                original.sample_accepted_tokens_up_to(4)
+            );
+        }
+    }
+
+    #[test]
+    fn request_profiles_persist_and_assignment_is_seeded() {
+        let rates = vec![vec![0.0; 3], vec![1.0; 3]];
+        let mut left = profile_sampler(Some(rates.clone()), 42);
+        let mut right = profile_sampler(Some(rates), 42);
+        let ids: Vec<_> = (1..=100).map(uuid::Uuid::from_u128).collect();
+        let initial: Vec<_> = ids
+            .iter()
+            .map(|id| left.sample_campaign_request(*id, 4))
+            .collect();
+        assert!(initial.contains(&1) && initial.contains(&4));
+        for _ in 0..10 {
+            for (id, expected) in ids.iter().zip(&initial) {
+                assert_eq!(left.sample_campaign_request(*id, 4), *expected);
+                assert_eq!(right.sample_campaign_request(*id, 4), *expected);
+            }
+        }
+        assert_eq!(left.campaign_assignments.len(), ids.len());
+    }
+
+    #[test]
+    fn profiles_respect_scheduled_draft_limits() {
+        let id = uuid::Uuid::from_u128(1);
+        let mut sampler = profile_sampler(Some(vec![vec![1.0; 3]]), 42);
+        for limit in 1..=6 {
+            assert_eq!(sampler.sample_campaign_request(id, limit), limit.min(4));
+        }
+        let mut clipped = profile_sampler(Some(vec![vec![0.8, 0.6, 0.4]]), 42);
+        let mut untouched = profile_sampler(Some(vec![vec![0.8, 0.6, 0.4]]), 42);
+        assert_eq!(clipped.sample_campaign_request(id, 1), 1);
+        for _ in 0..100 {
+            assert_eq!(
+                clipped.sample_campaign_request(id, 4),
+                untouched.sample_campaign_request(id, 4)
+            );
+        }
+    }
 
     #[test]
     fn zero_and_one_rates_are_exact() {

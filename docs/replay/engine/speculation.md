@@ -285,6 +285,34 @@ above, or a [hybrid G2](kv-cache.md#hybrid-g2) with `engine.speculation.disable_
 timing model are not necessarily supported by Replay; see
 [feature support](../features.md).
 
+### Experimental per-request acceptance profiles (vLLM)
+
+The opt-in diagnostic `AISIM_CAMPAIGN_ACCEPTANCE_PROFILES` points to a JSON
+file containing a list of conditional acceptance profiles. Each profile must
+contain one finite probability in `[0, 1]` per configured draft position; the
+list must be nonempty. For example, with three draft positions:
+
+```json
+[[0.95, 0.80, 0.60], [0.50, 0.20, 0.05]]
+```
+
+Each vLLM sampler assigns a uniformly selected profile to a request on its first
+verification call and retains that assignment for subsequent calls with the
+same request UUID. Profile selection has a separate seeded random stream;
+acceptance still stops at the first rejection and respects the scheduled draft
+limit. Repeated profiles can represent empirical frequencies. Unset the
+variable to preserve the existing acceptance stream and behavior.
+
+This changes simulated output progress, not forward-pass timing. The supplied
+profiles are workload assumptions; replay against data used to derive them is
+calibration, not independent prediction validation.
+
+This is a diagnostic interface, not a supported configuration schema. It is
+process-wide, is not recorded in saved configurations, and currently retains
+request assignments until the sampler is dropped. Invalid input fails at sampler
+construction. Only the vLLM scheduler uses these per-request profiles. Use finite
+replays and preserve the profile file separately for reproducibility.
+
 ### Measured SD-round FPM
 
 Ordinary `predict` can consume an explicitly tagged EAGLE3 profile through
