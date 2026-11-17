@@ -137,13 +137,13 @@ fn glm_state(name: &str, block: u32, cacheable: bool, checkpoint: bool) -> FpmCa
     }
 }
 
-/// Six GLM-5.3-Flash TP 4 cache groups as a hand-made profile of vLLM
-/// 0.31.0 or 0.32.0, at one page size. Their kinds and blocks are those that
+/// Six GLM-5.3-Flash TP 4 cache groups as a hand-made profile of vLLM 0.31.0,
+/// 0.32.0 or 0.33.0, at one page size. Their kinds and blocks are those that
 /// the vLLM 0.33.0 runtime probe records (fixture
-/// `glm53flash_vllm_0330_probe`): MLA attention and four KDA `MambaSpec`
-/// states with 2,176-token blocks, and a 4-token `CircularBufferSpec` ring.
-/// The layer counts and the page size are hand-made. With `checkpoint`, G2
-/// to G5 carry one FlashKDA checkpoint block at alignment 16.
+/// `glm53flash_vllm_0330_probe`): MLA attention and four KDA `MambaSpec` states
+/// with 2,176-token blocks, and a 4-token `CircularBufferSpec` ring. The layer
+/// counts and the page size are hand-made. With `checkpoint`, G2 to G5 carry
+/// one FlashKDA checkpoint block at alignment 16.
 /// The page is the sum of the pages of the attention layers, 13,045,120 bytes,
 /// the block row of vLLM 0.31.0. vLLM 0.32.0 rounds the row up to the least
 /// common multiple of the block-stride alignments of all layers (v0.32.0
@@ -164,9 +164,16 @@ fn glm_groups(checkpoint: bool) -> Vec<FpmCacheGroup> {
     groups
 }
 
-/// Three GLM cores: vLLM 0.31.0, and vLLM 0.32.0 without and with checkpoint
-/// blocks, which GLM-5.3-Flash takes only under the FlashKDA prefill backend.
-const GLM_CORES: [(&str, bool); 3] = [("0.31.0", false), ("0.32.0", false), ("0.32.0", true)];
+/// Five GLM cores: vLLM 0.31.0, and vLLM 0.32.0 and 0.33.0 each without and
+/// with checkpoint blocks, which GLM-5.3-Flash takes only under the FlashKDA
+/// prefill backend.
+const GLM_CORES: [(&str, bool); 5] = [
+    ("0.31.0", false),
+    ("0.32.0", false),
+    ("0.32.0", true),
+    ("0.33.0", false),
+    ("0.33.0", true),
+];
 
 fn prefix_core(
     groups: Vec<FpmCacheGroup>,
@@ -689,7 +696,8 @@ fn grouped_glm_shaped_multi_turn_replay_reports_hit_tokens_and_block_counts() {
         );
         // During the first step: G0 holds the four pinned blocks and the fresh
         // ones of the chunk, the ring one, each KDA group the cached and the
-        // running block, plus the checkpoint block on the third core.
+        // running block, plus the checkpoint block on the cores with checkpoint
+        // blocks.
         let (peak, after) = if checkpoint { (19, 15) } else { (14, 10) };
         assert_eq!(
             block_pool(&core).peak_active_blocks(),
@@ -787,7 +795,7 @@ fn grouped_prefix_admission_tests_the_whole_prompt() {
     for (version, checkpoint) in GLM_CORES {
         // A prompt of 40,000 tokens needs 19 G0 blocks, 1 ring block and one
         // running block per KDA group, plus one checkpoint block each on the
-        // third core: 24 or 28, above the 20-block pool.
+        // cores with checkpoint blocks: 24 or 28, above the 20-block pool.
         let mut core = prefix_core(glm_groups(checkpoint), 20 * GLM_PAGE, 8192, 2176, version);
         let id = submit(&mut core, 601, 40_000, 2);
         let request = &core.state.requests[&id].sequence;
@@ -908,7 +916,7 @@ fn grouped_prefix_waiting_request_keeps_fifo() {
 fn grouped_prefix_waiting_hit_waits_when_its_first_chunk_does_not_fit() {
     // One sliding-window group of 4-token blocks with an 8-token window, a
     // 9-block pool and a step budget of 8 tokens.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut window = group("window", 4, 8, Some(8));
         window.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![window], 9 * 8, 8, 4, version);
@@ -969,7 +977,7 @@ fn grouped_prefix_waiting_hit_keeps_its_lru_place_when_its_first_chunk_does_not_
             .key_hit(0, lease.prefix_hash_at(end).unwrap())
             .is_some()
     };
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut window = group("window", 4, 8, Some(8));
         window.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![window], 9 * 8, 8, 4, version);
@@ -1023,7 +1031,7 @@ fn grouped_prefix_without_chunked_prefill_budgets_the_uncached_tokens() {
     // :1160-1167), as the linear pool does. Two running requests decode one
     // token each and leave 14 of the 16 tokens. A prompt of 15 tokens with 12
     // cached tokens needs 3 of them.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let args = || {
             MockEngineArgs::builder()
                 .block_size(4)
@@ -1078,7 +1086,7 @@ fn fine_grained_core(version: &str) -> VllmCore {
     let mut state = state("state", 8, 1);
     state.block_size_tokens = 16;
     state.prefix_cacheable = Some(true);
-    state.prefill_checkpoint_blocks = (version == "0.32.0").then_some(0);
+    state.prefill_checkpoint_blocks = (version != "0.31.0").then_some(0);
     VllmCore::new(
         MockEngineArgs::builder()
             .block_size(4)
@@ -1107,7 +1115,7 @@ fn grouped_prefix_hit_that_needs_more_blocks_than_the_pool_waits() {
     // (single:1716-1816). Cold the prompt needs 4 of the 5 blocks. vLLM keeps
     // such a request waiting and searches its hit again at the next step
     // (v0.31 sched:930-937, :1223-1230, v0.32 sched:960-967, :1275-1282).
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         // With nothing running, nothing changes the cache, so the request
         // waits in every pass. The replay reports that as a livelock
         // (runtime_contract.rs grouped_prefix_hit_above_the_pool_is_a_livelock).
@@ -1292,7 +1300,7 @@ fn grouped_prefix_waiting_hit_follows_keys_that_enter_and_leave_the_pool() {
     // waiting request of 16 tokens is looked up in every step. Its hit must
     // follow the pool: none, then the keys of a finished equal request, then
     // none again once a long request evicts them.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut full = group("full", 4, 8, None);
         full.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
@@ -1321,7 +1329,7 @@ fn grouped_prefix_waiting_hit_follows_the_state_keys_published_in_the_step() {
     // and the next step its state lookup misses at 12, so it hits nothing.
     // The next step clears the set, and the same request hits 12 tokens with
     // no change of the resident keys.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut core = fine_grained_core(version);
         let mut trace = TraceCollector::default();
         let mut probe = waiting_probe(&core, 2101, (0..33).collect());
@@ -1340,7 +1348,7 @@ fn grouped_prefix_waiting_hit_follows_the_token_count_of_the_request() {
     // The hit stops below the last known token (mgr:289-295). A waiting
     // request of 8 tokens hits 4 of a cached 16-token prefix; one more token
     // lifts the cap, and the same pool gives 8.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut full = group("full", 4, 8, None);
         full.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
@@ -1361,7 +1369,7 @@ fn grouped_prefix_waiting_hit_follows_new_prefix_hashes_of_the_request() {
     // The prefix hashes are an input of the search. A waiting request that
     // hits 12 tokens of a cached prefix hits nothing once its hashes are set
     // from other tokens, with no change of the pool.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut full = group("full", 4, 8, None);
         full.prefix_cacheable = Some(true);
         let mut core = prefix_core(vec![full], 16 * 8, 64, 4, version);
@@ -1426,10 +1434,10 @@ fn single_group_cores(version: &str) -> (VllmCore, VllmCore) {
 
 #[test]
 fn single_full_attention_group_matches_the_linear_pool() {
-    // Both rule rows. One full-attention group at the hash block leaves every
+    // Every rule row. One full-attention group at the hash block leaves every
     // row difference inert (the last cacheable stop, the partial tail and the
-    // checkpoint block), so both rows match the linear pool.
-    for version in ["0.31.0", "0.32.0"] {
+    // checkpoint block), so every row matches the linear pool.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let (mut linear, mut grouped) = single_group_cores(version);
         let mut linear_trace = TraceCollector::default();
         let mut grouped_trace = TraceCollector::default();
